@@ -1,0 +1,60 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = [
+  ".git",
+  ".venv",
+  "build",
+  "dist",
+  "logs",
+  "ocr_runtime",
+  "umi",
+]
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP", "B", "SIM"]
+ignore = [
+  "B023",
+  "B905",
+  "E402",
+  "E501",
+  "E741",
+  "SIM102",
+  "SIM103",
+  "SIM105",
+  "SIM108",
+  "SIM117",
+  "UP022",
+  "UP042",
+  "W293",
+]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = false
+warn_redundant_casts = true
+show_error_codes = true
+pretty = true
+files = ["core", "app"]
+exclude = "^(build|dist|logs|ocr_runtime|umi|tests|scripts)/"
+
+[[tool.mypy.overrides]]
+module = [
+  "core.compare_history",
+  "core.services.background_tasks",
+  "core.services.background_worker",
+  "core.ocr_client",
+  "core.services.ocr_engines",
+  "core.services.ocr_models",
+  "core.services.ocr_orchestrator",
+  "core.services.ocr_state",
+  "core.services.ocr_validation",
+  "core.services.ocr_validation_models",
+  "app.view_models",
+]
+ignore_errors = false
+
+[[tool.mypy.overrides]]
+module = ["app.main_window"]
+ignore_errors = true

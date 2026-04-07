@@ -1,0 +1,41 @@
+.venv/
+.venv*/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+build/
+dist/
+release/
+*.spec.bak
+
+logs/
+*.log
+.coverage
+htmlcov/
+
+.idea/
+.vscode/
+.codebuddy/
+.DS_Store
+Thumbs.db
+
+# Runtime state and local OCR caches
+mappings/*.json
+ocr_runtime/.runtime_home/
+
+# Large local-only inputs, outputs and artifacts
+umi/
+*.tar
+*.pdf
+!docs/**/*.pdf
+!samples/manual-verification/**/*.pdf
+local-artifacts/
+
+# Historical build specs kept outside the canonical build entry
+VerbatimDbg.spec
+VerbatimDiag.spec
+VerbatimDir.spec
+Verbatim-win64-*.spec
