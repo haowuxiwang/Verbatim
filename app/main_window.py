@@ -59,6 +59,7 @@ from app.diff_presenter import (
     build_field_diff_details_html,
     populate_diff_lists,
 )
+from app.page_quality import evaluate_page_text_layer
 from app.view_models import CompareViewModel
 from core.compare_history import get_default_manager as get_default_compare_history_manager
 from core.diff_regions import diff_regions
@@ -1821,18 +1822,32 @@ class MainWindow(QMainWindow):
                 int(self._right_page_number),
             )
 
-            # Check for empty pages and warn
-            # v1.0 TODO: detect scanned PDFs and surface a warning
-            if self._left_page and len(self._left_page.text_chars) == 0:
-                print(f"[verbatim] Warning: Left PDF page {self._left_page_number} has no text (may be scanned image)")
-            # v1.0 TODO: detect scanned PDFs and surface a warning
-            if self._right_page and len(self._right_page.text_chars) == 0:
-                print(
-                    f"[verbatim] Warning: Right PDF page {self._right_page_number} has no text (may be scanned image)"
-                )
+            self._apply_page_text_layer_status("left", self._left_page_number, self._left_page, verbose=False)
+            self._apply_page_text_layer_status("right", self._right_page_number, self._right_page, verbose=False)
 
         except Exception as e:
             print(f"[verbatim] Failed to parse PDFs: {e}")
+
+    def _apply_page_text_layer_status(self, side: str, page_number: int, page: PageData | None, *, verbose: bool) -> None:
+        if page is None:
+            return
+        side_label = "Left" if side == "left" else "Right"
+        status = evaluate_page_text_layer(
+            side_label=side_label,
+            page_number=int(page_number),
+            text_char_count=len(page.text_chars),
+        )
+        if status.brief_log:
+            print(status.brief_log)
+        if verbose:
+            for line in status.warning_banner:
+                print(line)
+        if not status.force_ocr:
+            return
+        if side == "left":
+            self._left_force_ocr = True
+            return
+        self._right_force_ocr = True
 
     def _choose_left_pdf(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1992,9 +2007,10 @@ class MainWindow(QMainWindow):
                 str(self._left_pdf),
                 int(self._left_page_number),
             )
+            self._apply_page_text_layer_status("left", self._left_page_number, self._left_page, verbose=True)
 
-            # v1.0 TODO: detect scanned PDFs and warn the user
-            if self._left_page and len(self._left_page.text_chars) == 0:
+            # Legacy inline warning block retained temporarily during page-quality extraction.
+            if False and self._left_page and len(self._left_page.text_chars) == 0:
                 print(f"\n{'=' * 60}")
                 print("[!] 警告: 左侧PDF是扫描版，没有可用文本层。")
                 print("    已保留页面显示，可继续框选；对比时将优先尝试OCR回退。")
@@ -2051,9 +2067,10 @@ class MainWindow(QMainWindow):
                 str(self._right_pdf),
                 int(self._right_page_number),
             )
+            self._apply_page_text_layer_status("right", self._right_page_number, self._right_page, verbose=True)
 
-            # v1.0 TODO: detect scanned PDFs and warn the user
-            if self._right_page and len(self._right_page.text_chars) == 0:
+            # Legacy inline warning block retained temporarily during page-quality extraction.
+            if False and self._right_page and len(self._right_page.text_chars) == 0:
                 print(f"\n{'=' * 60}")
                 print("[!] 警告: 右侧PDF是扫描版，没有可用文本层。")
                 print("    已保留页面显示，可继续框选；对比时将优先尝试OCR回退。")
