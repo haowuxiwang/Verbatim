@@ -65,33 +65,45 @@ def build_executable():
 def check_output():
     """Check the output executable."""
     exe_path = CANONICAL_EXE
-    if exe_path.exists():
-        size_mb = exe_path.stat().st_size / (1024 * 1024)
-        print(f"\nExecutable created: {exe_path}")
-        print(f"File size: {size_mb:.1f} MB")
-
-        # Test if it runs (dry run)
-        print("\nTesting executable...")
-        probe = subprocess.run([str(exe_path), "--help"], check=False, capture_output=True, text=True)
-        if probe.returncode == 0:
-            print("Executable runs successfully!")
-        else:
-            print(f"Executable probe returned code {probe.returncode} (GUI mode may ignore --help)")
-    else:
-        print("❌ Executable not found!")
+    if not exe_path.exists():
+        print("Error: executable not found!")
         sys.exit(1)
+
+    size_mb = exe_path.stat().st_size / (1024 * 1024)
+    print(f"\nExecutable created: {exe_path}")
+    print(f"File size: {size_mb:.1f} MB")
+
+    # Do not probe the windowed GUI with `--help`: it can hang waiting for UI exit.
+    print("\nRunning packaged business smoke...")
+    probe = subprocess.run(
+        [sys.executable, "scripts/frozen_business_smoke.py", "--exe", str(exe_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if probe.returncode == 0:
+        print("Packaged business smoke passed!")
+        if probe.stdout.strip():
+            print(probe.stdout.strip())
+        return
+
+    print(f"Packaged business smoke failed with exit code {probe.returncode}")
+    if probe.stdout.strip():
+        print(probe.stdout.strip())
+    if probe.stderr.strip():
+        print(probe.stderr.strip())
+    sys.exit(probe.returncode)
 
 
 if __name__ == "__main__":
     print("=== Verbatim Build Script ===")
     print(f"Build time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-    # Check if we're in the right directory
     if not Path("main.py").exists():
         print("Error: main.py not found. Please run this script from the project root.")
         sys.exit(1)
 
-    # Check virtual environment
     if not Path(".venv").exists():
         print("Warning: Virtual environment not found. Dependencies might be missing.")
 

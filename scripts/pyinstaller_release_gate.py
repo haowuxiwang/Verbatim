@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--startup-timeout-sec", type=int, default=12)
     p.add_argument("--skip-exe-run", action="store_true")
     p.add_argument("--skip-source-tests", action="store_true")
+    p.add_argument("--skip-business-smoke", action="store_true")
     return p.parse_args()
 
 
@@ -87,6 +88,25 @@ def _smoke_run_exe(exe_path: Path, timeout_sec: int) -> tuple[bool, str]:
         return False, f"launch_error:{e}"
 
 
+def _run_business_smoke(root: Path, *, exe_path: Path | None) -> tuple[bool, str]:
+    cmd = ["python", "scripts/frozen_business_smoke.py"]
+    if exe_path is not None:
+        cmd.extend(["--exe", str(exe_path)])
+    proc = subprocess.run(
+        cmd,
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    output = (proc.stdout or "").strip().splitlines()
+    tail = "\n".join(output[-8:]) if output else ""
+    return proc.returncode == 0, tail
+
+
 def main() -> int:
     args = parse_args()
     root = Path.cwd()
@@ -104,6 +124,11 @@ def main() -> int:
     smoke_note = "skipped"
     if not args.skip_exe_run:
         smoke_ok, smoke_note = _smoke_run_exe(exe_path, int(args.startup_timeout_sec))
+    business_ok = True
+    business_note = "skipped"
+    if not args.skip_business_smoke:
+        business_target = None if args.skip_exe_run else exe_path
+        business_ok, business_note = _run_business_smoke(root, exe_path=business_target)
     source_ok = True
     source_note = "skipped"
     if not args.skip_source_tests:
@@ -117,9 +142,11 @@ def main() -> int:
         "exe_path": str(exe_path),
         "source_smoke_ok": source_ok,
         "source_smoke_note": source_note,
+        "business_smoke_ok": business_ok,
+        "business_smoke_note": business_note,
         "smoke_ok": smoke_ok,
         "smoke_note": smoke_note,
-        "gate_pass": bool(req_ok and build_entry_ok and source_ok and smoke_ok),
+        "gate_pass": bool(req_ok and build_entry_ok and source_ok and business_ok and smoke_ok),
     }
     print("RELEASE_GATE " + json.dumps(result, ensure_ascii=False))
     return 0 if result.get("gate_pass") else 2

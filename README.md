@@ -56,4 +56,4 @@ python build.py
 
 - `app/main_window.py` is still oversized and only partially extracted.
 - `app.main_window` is still excluded from strict mypy coverage.
-- `--skip-exe-run` is a fast source-side check, not a full frozen-app acceptance signal.
+- `python scripts/pyinstaller_release_gate.py --skip-exe-run` now includes a source-side business smoke, but it is still not a full frozen-app acceptance signal.
