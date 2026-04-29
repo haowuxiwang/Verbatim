@@ -154,6 +154,7 @@ class OcrConfig:
     retry_backoff_sec: float = 1.0
     proxy_url: str = ""
     source: str = "env"
+    token_storage: str = "env"
 
     def __post_init__(self) -> None:
         self.timeout_sec = max(1, int(self.timeout_sec))
@@ -181,6 +182,7 @@ class OcrConfig:
             retry_backoff_sec=float(os.getenv("VERBATIM_OCR_RETRY_BACKOFF_SEC") or "1.0"),
             proxy_url=(os.getenv("VERBATIM_OCR_PROXY_URL") or "").strip(),
             source="env",
+            token_storage="env",
         )
 
     @staticmethod
@@ -216,6 +218,7 @@ class OcrConfig:
             retry_backoff_sec=float(obj.get("retry_backoff_sec", 1.0)),
             proxy_url=str(obj.get("proxy_url", "")).strip(),
             source="file",
+            token_storage="dpapi" if token_enc else "plain",
         )
         # Backward compatibility migration: legacy plaintext config -> encrypted storage on Windows.
         if _is_windows() and plain_token and not token_enc:
@@ -238,6 +241,7 @@ class OcrConfig:
         token_enc = _dpapi_encrypt_text(self.token)
         if token_enc and _dpapi_decrypt_text(token_enc) != self.token:
             token_enc = None
+        token_storage = "dpapi" if token_enc else "plain"
         obj = {
             "sync_url": self.sync_url,
             "job_url": self.job_url,
@@ -252,10 +256,10 @@ class OcrConfig:
         }
         if token_enc:
             obj["token_enc"] = token_enc
-            obj["token_storage"] = "dpapi"
         else:
             obj["token"] = self.token
-            obj["token_storage"] = "plain"
+        obj["token_storage"] = token_storage
+        self.token_storage = token_storage
         p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
         return p
 
@@ -623,7 +627,7 @@ class PaddleOcrClient:
         for k, v in obj.items():
             lk = str(k).lower()
             if lk in direct_keys and isinstance(v, str):
-                if include_aux and cls._looks_like_non_text_value(v):
+                if cls._looks_like_non_text_value(v):
                     continue
                 out.append(v)
             else:

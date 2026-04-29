@@ -23,6 +23,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Any, cast
 
 import fitz  # PyMuPDF
 from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, Qt, Signal, Slot
@@ -70,7 +71,7 @@ from core.field_mapper import (
     format_field_diff_description,
     should_enable_field_mapping,
 )
-from core.models import BBox, CharData, DiffOp, DiffOpType, RegionData, StyleFlags
+from core.models import BBox, CharData, DiffOp, DiffOpType, PageData, RegionData, StyleFlags
 from core.ocr_client import (
     DEFAULT_JOB_URL,
     DEFAULT_MODEL,
@@ -91,11 +92,20 @@ from core.services.compare_orchestrator import (
 )
 from core.services.field_orchestrator import run_field_mapping
 from core.services.observability import log_event
-from core.services.ocr_engines import CloudPaddleEngine, LocalPaddleEngine, LocalPaddleOcrJsonEngine
+from core.services.ocr_engines import (
+    CloudPaddleEngine,
+    LocalOcrSelfCheck,
+    LocalPaddleEngine,
+    LocalPaddleOcrJsonEngine,
+    resolve_ocr_json_exe_path,
+    resolve_ocr_runtime_dir,
+    run_local_ocr_self_check,
+)
 from core.services.ocr_errors import classify_ocr_error
 from core.services.ocr_models import OcrResult, OcrSpan
 from core.services.ocr_orchestrator import run_ocr_fallback
 from core.services.ocr_state import OcrRunState, compute_ocr_status
+from core.services.prealign import DocumentProfile, build_document_profile, retrieve_page_candidates, suggest_region_candidates
 from core.services.ocr_validation import (
     summarize_text,
     validate_ocr_input,
@@ -118,6 +128,8 @@ from core.services.text_quality import (
 from core.services.text_quality import (
     should_try_ocr_side as svc_should_try_ocr_side,
 )
+
+OcrEngine = CloudPaddleEngine | LocalPaddleEngine | LocalPaddleOcrJsonEngine
 
 RENDER_ZOOM = 2.0
 ZOOM_MIN = 0.25
@@ -346,11 +358,11 @@ class SelectableImageLabel(OverlayImageLabel):
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         if self._is_panning and self._pan_start is not None:
             # Pan mode: scroll the parent scroll area
-            scroll_area = self.parent()
-            while scroll_area and not isinstance(scroll_area, QScrollArea):
+            scroll_area: QObject | None = self.parent()
+            while scroll_area is not None and not isinstance(scroll_area, QScrollArea):
                 scroll_area = scroll_area.parent()
 
-            if scroll_area:
+            if isinstance(scroll_area, QScrollArea):
                 current = event.position().toPoint()
                 delta = self._pan_start - current
 
@@ -469,6 +481,7 @@ class PdfImageViewer(QWidget):
         self._empty_view.setLayout(empty_layout)
         self._empty_view.setStyleSheet("background:#ffffff;")
 
+        self._image: OverlayImageLabel
         if selectable:
             self._image = SelectableImageLabel("(drag to select)")
             self._image.selectionFinished.connect(self.selectionFinished)
@@ -850,6 +863,12 @@ class MainWindow(QMainWindow):
         self._right_page_number = 0
         self._left_page_count = 0
         self._right_page_count = 0
+        self._left_committed_page_number = 0
+        self._right_committed_page_number = 0
+        self._left_nav_epoch = 0
+        self._right_nav_epoch = 0
+        self._left_nav_loading = False
+        self._right_nav_loading = False
         self._base_render_zoom = RENDER_ZOOM
         self._left_zoom_ratio = 1.0
         self._right_zoom_ratio = 1.0
@@ -871,6 +890,8 @@ class MainWindow(QMainWindow):
         self._ocr_client: PaddleOcrClient | None = None
         self._local_ocr_engine: LocalPaddleEngine | None = None
         self._local_ocr_json_engine: LocalPaddleOcrJsonEngine | None = None
+        self._local_ocr_self_check: LocalOcrSelfCheck | None = None
+        self._local_ocr_self_check_key: tuple[str, str, bool, str] | None = None
         self._last_ocr_note = ""
         self._last_ocr_errors: list[str] = []
         self._last_ocr_error_codes: list[str] = []
@@ -891,29 +912,31 @@ class MainWindow(QMainWindow):
         self._trace_id = ""
         self._is_comparing = False
         self._last_compare_debug_state: tuple[bool, bool, bool, bool, bool] | None = None
-        self._last_diff_ops = []
+        self._last_diff_ops: list[DiffOp] = []
         self._last_left_region: RegionData | None = None
         self._last_right_region: RegionData | None = None
+        self._last_left_spans: list[OcrSpan] = []
+        self._last_right_spans: list[OcrSpan] = []
+        self._last_quality_warnings: list[str] = []
         self._last_left_ocr_applied = False
         self._last_right_ocr_applied = False
         self._last_left_ocr_has_coords = False
         self._last_right_ocr_has_coords = False
-        self._last_left_ocr_has_coords = False
-        self._last_right_ocr_has_coords = False
         self._last_left_coords_reliable = True
         self._last_right_coords_reliable = True
-        self._focused_diff_op = None
+        self._focused_diff_op: DiffOp | None = None
         # Keep OCR/network waits bounded for interactive UX.
         self._bg_task_timeout_ms = int(os.getenv("VERBATIM_BG_TASK_TIMEOUT_MS", "25000") or "25000")
         self._compact_ui = False
-        self._left_doc_profile = None
-        self._right_doc_profile = None
+        self._left_doc_profile: DocumentProfile | None = None
+        self._right_doc_profile: DocumentProfile | None = None
         self._prealign_active = False
         self._prealign_manual_adjust_steps = 0
         self._prealign_base_left_bbox: BBox | None = None
         self._prealign_base_right_bbox: BBox | None = None
         self._prealign_last_left_bbox: BBox | None = None
         self._prealign_last_right_bbox: BBox | None = None
+        self._compare_input_state: dict[str, bool] = {}
         self._left_force_ocr = False
         self._right_force_ocr = False
         self._left_doc_quality_note = ""
@@ -1653,8 +1676,17 @@ class MainWindow(QMainWindow):
         cloud_ok = bool(self._ocr_cfg and self._ocr_cfg.token.strip())
         local_runtime = self._ocr_runtime_dir()
         local_json = self._ocr_json_exe_path()
-        local_capable = route in {"local_first", "local_only"} and (local_runtime is not None or local_json is not None)
+        local_check = self._get_local_ocr_self_check()
+        local_capable = route in {"local_first", "local_only"} and bool(local_check and local_check.available)
         has_any = cloud_ok or local_capable
+        storage_mode = (self._ocr_cfg.token_storage if self._ocr_cfg else "none").strip().lower()
+        storage_labels = {
+            "env": "环境变量",
+            "dpapi": "DPAPI 加密",
+            "plain": "明文存储",
+            "none": "未配置",
+        }
+        storage_label = storage_labels.get(storage_mode, storage_mode or "未知")
         self._ocr_mode_combo.setEnabled(cloud_ok)
         self._btn_dual_ocr.setEnabled(has_any)
         if has_any:
@@ -1662,12 +1694,19 @@ class MainWindow(QMainWindow):
             self._btn_use_ocr.setEnabled(True)
             self._auto_ocr_enabled = True
             if cloud_ok:
-                self._btn_use_ocr.setToolTip(f"自动OCR回退已启用（当前配置来源：{src}，路由={route}）")
-                self._ocr_token_status.setText(f"OCR Token: ● 已配置（{src}）")
+                self._btn_use_ocr.setToolTip(f"自动OCR回退已启用（当前配置来源：{src}，存储={storage_label}，路由={route}）")
+                self._ocr_token_status.setText(f"OCR Token: ● 已配置（{src}，{storage_label}）")
+                local_note = ""
+                if route in {"local_first", "local_only"} and local_check is not None and not local_check.available:
+                    local_note = f" | {self._format_local_ocr_hint(local_check, local_runtime, local_json)}"
+                self._btn_use_ocr.setToolTip(
+                    f"自动 OCR 已启用（来源：{src}，存储：{storage_label}，路由：{route}{local_note}）"
+                )
+                self._ocr_token_status.setText(f"OCR Token: 已配置（{src}/{storage_label}）{local_note}")
             else:
-                local_hint = f"runtime={local_runtime}" if local_runtime else "PaddleOCR-json"
-                self._btn_use_ocr.setToolTip(f"自动OCR回退已启用（本地优先，路由={route}，{local_hint}）")
-                self._ocr_token_status.setText("OCR Token: ○ 未配置（使用本地OCR）")
+                local_hint = self._format_local_ocr_hint(local_check, local_runtime, local_json)
+                self._btn_use_ocr.setToolTip(f"自动 OCR 已启用（本地优先，路由：{route}，{local_hint}）")
+                self._ocr_token_status.setText(f"OCR Token: 未配置（本地 OCR：{local_hint}）")
             if self._local_ocr_breaker_open():
                 remain = max(0, int(self._local_ocr_cooldown_until - time.monotonic()))
                 self._btn_use_ocr.setToolTip(self._btn_use_ocr.toolTip() + f" | 本地OCR熔断中，剩余{remain}s")
@@ -1677,9 +1716,50 @@ class MainWindow(QMainWindow):
             self._btn_use_ocr.setEnabled(False)
             self._btn_dual_ocr.setChecked(False)
             self._auto_ocr_enabled = False
-            self._btn_use_ocr.setToolTip("OCR功能已禁用：无云端配置且未检测到本地OCR runtime/PaddleOCR-json")
-            self._ocr_token_status.setText("OCR Token: ● 未配置（未检测到本地runtime）")
+            blocked_note = ""
+            if local_check is not None and not local_check.available:
+                blocked_note = f"（{self._format_local_ocr_hint(local_check, local_runtime, local_json)}）"
+            self._btn_use_ocr.setToolTip(f"OCR 功能已禁用：无云端配置且无可用本地 OCR{blocked_note}")
+            self._ocr_token_status.setText(f"OCR Token: 未配置（未检测到可用本地 OCR）{blocked_note}")
             self._ocr_token_status.setStyleSheet("color:#c0392b;font-size:12px;font-weight:600;")
+
+    @staticmethod
+    def _format_local_ocr_hint(
+        local_check: LocalOcrSelfCheck | None,
+        local_runtime: Path | None,
+        local_json: Path | None,
+    ) -> str:
+        if local_check is None:
+            if local_runtime is not None:
+                return f"runtime={local_runtime}"
+            if local_json is not None:
+                return "PaddleOCR-json"
+            return "未配置"
+        if local_check.available:
+            parts: list[str] = []
+            if local_check.python_worker_ready:
+                parts.append("python-worker-ready")
+            if local_check.json_ready:
+                parts.append("json-ready")
+            return ", ".join(parts) or "local-ready"
+        if local_check.code == "numpy_abi_mismatch":
+            return "blocked:numpy_abi_mismatch，需独立 OCR 环境（numpy<2）"
+        if local_check.code == "module_missing":
+            return "blocked:module_missing，需安装 paddlepaddle/paddleocr/paddlex"
+        if local_check.code == "worker_missing":
+            return "blocked:worker_missing，请设置 VERBATIM_OCR_WORKER_PYTHON"
+        return f"blocked:{local_check.code}"
+
+    @staticmethod
+    def _build_ocr_storage_note(token_storage: str) -> str:
+        storage_mode = str(token_storage or "").strip().lower()
+        if storage_mode == "dpapi":
+            return "当前 Token 已使用 DPAPI 加密保存。"
+        if storage_mode == "plain":
+            return "警告：当前 Token 因 DPAPI 不可用而以明文写入本地配置文件。"
+        if storage_mode == "env":
+            return "当前运行时优先使用环境变量中的 Token；本地保存仅作为后备配置。"
+        return "当前 Token 存储状态未知，请复核本地配置。"
 
     def _toggle_format_diffs(self) -> None:
         """Toggle format diff visibility."""
@@ -1788,18 +1868,23 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            png_bytes = self._run_process_task_with_ui_pump(
-                "render_page_png",
-                str(pdf_path),
-                int(page_number),
-                float(self._render_zoom_for(side)),
-            )
-            pix = QPixmap()
-            if not pix.loadFromData(png_bytes, "PNG"):
-                raise RuntimeError("failed to decode rendered PNG bytes")
-            view.set_pixmap(pix)
+            view.set_pixmap(self._render_page_pixmap(pdf_path, page_number=page_number, side=side))
         except Exception as e:
             view.set_error(f"Failed to render {pdf_path.name}: {e}")
+
+    def _render_page_pixmap(self, pdf_path: Path, *, page_number: int = 0, side: str = "left") -> QPixmap:
+        png_bytes = self._run_process_task_with_ui_pump(
+            "render_page_png",
+            str(pdf_path),
+            int(page_number),
+            float(self._render_zoom_for(side)),
+        )
+        pix = QPixmap()
+        # PySide6 on Windows rejects the explicit format overload here even for valid PNG bytes.
+        # Let Qt sniff the image header instead so rendered pages decode reliably.
+        if not pix.loadFromData(cast(bytes, png_bytes)):
+            raise RuntimeError("failed to decode rendered PNG bytes")
+        return pix
 
     def _load_page_data(self) -> None:
         """Parse both PDFs into PageData (cached for region extraction)."""
@@ -1904,6 +1989,9 @@ class MainWindow(QMainWindow):
 
         # Reset page number
         self._left_page_number = 0
+        self._left_committed_page_number = 0
+        self._left_nav_epoch = 0
+        self._left_nav_loading = False
         self._left_force_ocr, self._left_doc_quality_note = self._assess_pdf_side_quality(
             pdf_path, self._left_page_count, "左侧"
         )
@@ -1948,6 +2036,9 @@ class MainWindow(QMainWindow):
 
         # Reset page number
         self._right_page_number = 0
+        self._right_committed_page_number = 0
+        self._right_nav_epoch = 0
+        self._right_nav_loading = False
         self._right_force_ocr, self._right_doc_quality_note = self._assess_pdf_side_quality(
             pdf_path, self._right_page_count, "右侧"
         )
@@ -1961,123 +2052,152 @@ class MainWindow(QMainWindow):
 
     def _left_prev_page(self) -> None:
         if self._left_page_number > 0:
-            self._left_page_number -= 1
-            self._left_page_combo.blockSignals(True)
-            self._left_page_combo.setCurrentIndex(self._left_page_number)
-            self._left_page_combo.blockSignals(False)
-            self._update_left_page()
+            self._set_page_index("left", self._left_page_number - 1)
 
     def _left_next_page(self) -> None:
         if self._left_page_number < self._left_page_count - 1:
-            self._left_page_number += 1
-            self._left_page_combo.blockSignals(True)
-            self._left_page_combo.setCurrentIndex(self._left_page_number)
-            self._left_page_combo.blockSignals(False)
-            self._update_left_page()
+            self._set_page_index("left", self._left_page_number + 1)
 
     def _left_page_combo_changed(self, index: int) -> None:
-        self._left_page_number = index
-        self._update_left_page()
+        self._set_page_index("left", index)
 
     def _update_left_page(self) -> None:
         if self._left_pdf is None:
             return
-        self._clear_cached_diff_result()
+        self._left_nav_loading = True
+        self._sync_page_controls("left")
+        while True:
+            requested_page = self._left_page_number
+            requested_epoch = self._left_nav_epoch
+            self._clear_cached_diff_result()
+            self.left_view.set_overlays([])
+            self.left_view.set_selected_overlays([])
+            self._left_sel_bbox = None
+            self._update_compare_enabled()
+            try:
+                pixmap = self._render_page_pixmap(self._left_pdf, page_number=requested_page, side="left")
+                page = self._run_process_task_with_ui_pump(
+                    "parse_page",
+                    str(self._left_pdf),
+                    int(requested_page),
+                )
+            except Exception as e:
+                if requested_epoch != self._left_nav_epoch or requested_page != self._left_page_number:
+                    continue
+                self.left_view.set_error(f"Failed to render {self._left_pdf.name}: {e}")
+                print(f"[verbatim] Failed to parse left page: {e}")
+                break
+            if requested_epoch != self._left_nav_epoch or requested_page != self._left_page_number:
+                continue
+            self.left_view.set_pixmap(pixmap)
+            self._left_page = page
+            self._left_committed_page_number = requested_page
+            self._apply_page_text_layer_status("left", requested_page, self._left_page, verbose=True)
+            break
+        self._left_nav_loading = False
+        self._sync_page_controls("left")
 
-        # Update button states
-        self._btn_left_prev.setEnabled(self._left_page_number > 0)
-        self._btn_left_next.setEnabled(self._left_page_number < self._left_page_count - 1)
+    def _clamp_page_index(self, side: str, index: int) -> int:
+        page_count = self._left_page_count if side == "left" else self._right_page_count
+        if page_count <= 0:
+            return 0
+        return max(0, min(int(index), page_count - 1))
 
-        # Update title
-        self.left_view.set_title(f"左侧: {self._left_pdf.name} (第{self._left_page_number + 1}页)")
+    def _sync_page_controls(self, side: str) -> None:
+        if side == "left":
+            combo = self._left_page_combo
+            page_number = self._left_page_number
+            committed_page = self._left_committed_page_number
+            page_count = self._left_page_count
+            pdf = self._left_pdf
+            is_loading = self._left_nav_loading
+            self._btn_left_prev.setEnabled((not is_loading) and page_number > 0)
+            self._btn_left_next.setEnabled((not is_loading) and page_number < page_count - 1)
+            combo.setEnabled((not is_loading) and page_count > 0)
+            if pdf is not None:
+                suffix = " (加载中)" if is_loading and page_number != committed_page else ""
+                self.left_view.set_title(f"左侧: {pdf.name} (第{page_number + 1}页){suffix}")
+        else:
+            combo = self._right_page_combo
+            page_number = self._right_page_number
+            committed_page = self._right_committed_page_number
+            page_count = self._right_page_count
+            pdf = self._right_pdf
+            is_loading = self._right_nav_loading
+            self._btn_right_prev.setEnabled((not is_loading) and page_number > 0)
+            self._btn_right_next.setEnabled((not is_loading) and page_number < page_count - 1)
+            combo.setEnabled((not is_loading) and page_count > 0)
+            if pdf is not None:
+                suffix = " (加载中)" if is_loading and page_number != committed_page else ""
+                self.right_view.set_title(f"右侧: {pdf.name} (第{page_number + 1}页){suffix}")
 
-        # Reload page
-        self.left_view.set_overlays([])
-        self.left_view.set_selected_overlays([])
-        self._load_into_view(self.left_view, self._left_pdf, page_number=self._left_page_number, side="left")
+        clamped_index = self._clamp_page_index(side, page_number)
+        if combo.currentIndex() != clamped_index:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(clamped_index)
+            combo.blockSignals(False)
 
-        # Clear selection
-        self._left_sel_bbox = None
-        self._update_compare_enabled()
-
-        # Parse the new page
-        try:
-            self._left_page = self._run_process_task_with_ui_pump(
-                "parse_page",
-                str(self._left_pdf),
-                int(self._left_page_number),
-            )
-            self._apply_page_text_layer_status("left", self._left_page_number, self._left_page, verbose=True)
-
-            # Legacy inline warning block retained temporarily during page-quality extraction.
-            if False and self._left_page and len(self._left_page.text_chars) == 0:
-                print(f"\n{'=' * 60}")
-                print("[!] 警告: 左侧PDF是扫描版，没有可用文本层。")
-                print("    已保留页面显示，可继续框选；对比时将优先尝试OCR回退。")
-                print(f"{'=' * 60}\n")
-                self._left_force_ocr = True
-        except Exception as e:
-            print(f"[verbatim] Failed to parse left page: {e}")
+    def _set_page_index(self, side: str, index: int) -> None:
+        clamped_index = self._clamp_page_index(side, index)
+        if side == "left":
+            self._left_page_number = clamped_index
+            self._left_nav_epoch += 1
+            self._sync_page_controls("left")
+            if not self._left_nav_loading:
+                self._update_left_page()
+            return
+        self._right_page_number = clamped_index
+        self._right_nav_epoch += 1
+        self._sync_page_controls("right")
+        if not self._right_nav_loading:
+            self._update_right_page()
 
     def _right_prev_page(self) -> None:
         if self._right_page_number > 0:
-            self._right_page_number -= 1
-            self._right_page_combo.blockSignals(True)
-            self._right_page_combo.setCurrentIndex(self._right_page_number)
-            self._right_page_combo.blockSignals(False)
-            self._update_right_page()
+            self._set_page_index("right", self._right_page_number - 1)
 
     def _right_next_page(self) -> None:
         if self._right_page_number < self._right_page_count - 1:
-            self._right_page_number += 1
-            self._right_page_combo.blockSignals(True)
-            self._right_page_combo.setCurrentIndex(self._right_page_number)
-            self._right_page_combo.blockSignals(False)
-            self._update_right_page()
+            self._set_page_index("right", self._right_page_number + 1)
 
     def _right_page_combo_changed(self, index: int) -> None:
-        self._right_page_number = index
-        self._update_right_page()
+        self._set_page_index("right", index)
 
     def _update_right_page(self) -> None:
         if self._right_pdf is None:
             return
-        self._clear_cached_diff_result()
-
-        # Update button states
-        self._btn_right_prev.setEnabled(self._right_page_number > 0)
-        self._btn_right_next.setEnabled(self._right_page_number < self._right_page_count - 1)
-
-        # Update title
-        self.right_view.set_title(f"右侧: {self._right_pdf.name} (第{self._right_page_number + 1}页)")
-
-        # Reload page
-        self.right_view.set_overlays([])
-        self.right_view.set_selected_overlays([])
-        self._load_into_view(self.right_view, self._right_pdf, page_number=self._right_page_number, side="right")
-
-        # Clear selection
-        self._right_sel_bbox = None
-        self._update_compare_enabled()
-
-        # Parse the new page
-        try:
-            self._right_page = self._run_process_task_with_ui_pump(
-                "parse_page",
-                str(self._right_pdf),
-                int(self._right_page_number),
-            )
-            self._apply_page_text_layer_status("right", self._right_page_number, self._right_page, verbose=True)
-
-            # Legacy inline warning block retained temporarily during page-quality extraction.
-            if False and self._right_page and len(self._right_page.text_chars) == 0:
-                print(f"\n{'=' * 60}")
-                print("[!] 警告: 右侧PDF是扫描版，没有可用文本层。")
-                print("    已保留页面显示，可继续框选；对比时将优先尝试OCR回退。")
-                print(f"{'=' * 60}\n")
-                self._right_force_ocr = True
-        except Exception as e:
-            print(f"[verbatim] Failed to parse right page: {e}")
+        self._right_nav_loading = True
+        self._sync_page_controls("right")
+        while True:
+            requested_page = self._right_page_number
+            requested_epoch = self._right_nav_epoch
+            self._clear_cached_diff_result()
+            self.right_view.set_overlays([])
+            self.right_view.set_selected_overlays([])
+            self._right_sel_bbox = None
+            self._update_compare_enabled()
+            try:
+                pixmap = self._render_page_pixmap(self._right_pdf, page_number=requested_page, side="right")
+                page = self._run_process_task_with_ui_pump(
+                    "parse_page",
+                    str(self._right_pdf),
+                    int(requested_page),
+                )
+            except Exception as e:
+                if requested_epoch != self._right_nav_epoch or requested_page != self._right_page_number:
+                    continue
+                self.right_view.set_error(f"Failed to render {self._right_pdf.name}: {e}")
+                print(f"[verbatim] Failed to parse right page: {e}")
+                break
+            if requested_epoch != self._right_nav_epoch or requested_page != self._right_page_number:
+                continue
+            self.right_view.set_pixmap(pixmap)
+            self._right_page = page
+            self._right_committed_page_number = requested_page
+            self._apply_page_text_layer_status("right", requested_page, self._right_page, verbose=True)
+            break
+        self._right_nav_loading = False
+        self._sync_page_controls("right")
 
     def _maybe_parse_pages(self) -> None:
         """Parse pages once both PDFs are selected."""
@@ -2291,6 +2411,9 @@ class MainWindow(QMainWindow):
 
     def _update_compare_enabled(self) -> None:
         ready = (
+            not self._left_nav_loading
+            and not self._right_nav_loading
+            and
             self._left_page is not None
             and self._right_page is not None
             and self._left_sel_bbox is not None
@@ -2520,6 +2643,8 @@ class MainWindow(QMainWindow):
         ocr_state: OcrRunState | None = None,
         ocr_state_reason: str = "",
         ocr_error_codes: list[str] | None = None,
+        left_coords_reliable: bool = True,
+        right_coords_reliable: bool = True,
     ) -> tuple[str, str]:
         if ocr_was_recommended and ocr_state == OcrRunState.BLOCKED:
             return "REVIEW", f"OCR未实际运行（原因={ocr_state_reason or 'blocked'}），已降级为人工复核"
@@ -2540,10 +2665,12 @@ class MainWindow(QMainWindow):
         # Conservative gate for OCR-heavy flows: unreliable OCR should not produce hard diffs.
         if timeout_hit and any_ocr and (lq != "good" or rq != "good"):
             return "REVIEW", "OCR超时且文本质量不足，已降级为人工复核"
-        if any_ocr and (lc < 82 or rc < 82):
-            return "REVIEW", f"OCR置信度偏低(left={lc}, right={rc})，已降级为人工复核"
         if any_ocr and sim >= 0.97 and (lq != "good" or rq != "good"):
             return "REVIEW", f"OCR场景文本高相似(sim={sim:.3f})，疑似噪声差异，已降级为人工复核"
+        if any_ocr and (not left_coords_reliable or not right_coords_reliable):
+            return "REFERENCE_ONLY", "OCR文本可用但定位不可信，已降级为文本参考结果"
+        if any_ocr and (lc < 82 or rc < 82 or lq != "good" or rq != "good"):
+            return "REFERENCE_ONLY", f"OCR文本已采用但置信度偏低(left={lc}, right={rc})，结果仅供参考"
         return "PASS", ""
 
     @staticmethod
@@ -2589,8 +2716,8 @@ class MainWindow(QMainWindow):
                     type=DiffOpType.VISUAL_DIFF,
                     left_indices=[],
                     right_indices=[],
-                    left_bboxes=[tuple(float(v) for v in left_bbox)],
-                    right_bboxes=[tuple(float(v) for v in right_bbox)],
+                    left_bboxes=[cast(BBox, tuple(float(v) for v in left_bbox))],
+                    right_bboxes=[cast(BBox, tuple(float(v) for v in right_bbox))],
                     meta={
                         "left_text": "",
                         "right_text": "",
@@ -2777,11 +2904,14 @@ class MainWindow(QMainWindow):
         self._ocr_client = None
         self._local_ocr_engine = None
         self._local_ocr_json_engine = None
+        self._local_ocr_self_check = None
+        self._local_ocr_self_check_key = None
         self._refresh_ocr_ui_state()
+        storage_note = self._build_ocr_storage_note(cfg.token_storage)
         QMessageBox.information(
             self,
             "OCR设置",
-            f"已保存到：{saved}\n如设置了 VERBATIM_OCR_TOKEN，运行时将优先使用环境变量。",
+            f"已保存到：{saved}\n{storage_note}\n如设置了 VERBATIM_OCR_TOKEN，运行时将优先使用环境变量。",
         )
 
     def _open_diagnostics(self) -> None:
@@ -2791,6 +2921,7 @@ class MainWindow(QMainWindow):
         token_present = bool(self._ocr_cfg and self._ocr_cfg.token.strip())
         runtime_dir = self._ocr_runtime_dir()
         json_exe = self._ocr_json_exe_path()
+        local_check = self._get_local_ocr_self_check(force=True)
         json_args = (os.getenv("VERBATIM_PADDLEOCR_JSON_ARGS") or "").strip()
         breaker_open = self._local_ocr_breaker_open()
         breaker_left = max(0, int(self._local_ocr_cooldown_until - time.monotonic())) if breaker_open else 0
@@ -2804,6 +2935,16 @@ class MainWindow(QMainWindow):
             "local_runtime_dir": str(runtime_dir) if runtime_dir else "",
             "local_paddleocr_json_exe": str(json_exe) if json_exe else "",
             "local_paddleocr_json_args": json_args,
+            "local_ocr_self_check": {
+                "available": bool(local_check.available),
+                "code": str(local_check.code),
+                "message": str(local_check.message),
+                "worker_python": str(local_check.worker_python),
+                "runtime_dir": str(local_check.runtime_dir),
+                "json_exe": str(local_check.json_exe),
+                "python_worker_ready": bool(local_check.python_worker_ready),
+                "json_ready": bool(local_check.json_ready),
+            },
             "local_breaker_open": breaker_open,
             "local_breaker_left_sec": breaker_left,
             "last_ocr_errors": list(self._last_ocr_errors or []),
@@ -2902,7 +3043,7 @@ class MainWindow(QMainWindow):
         if oidx2 >= 0:
             self._ocr_mode_combo.setCurrentIndex(oidx2)
 
-    def _ensure_doc_profiles(self) -> tuple[object, object] | None:
+    def _ensure_doc_profiles(self) -> tuple[DocumentProfile, DocumentProfile] | None:
         if self._left_pdf is None or self._right_pdf is None:
             QMessageBox.warning(self, "预对齐建议", "请先加载左右文档。")
             return None
@@ -2960,6 +3101,8 @@ class MainWindow(QMainWindow):
             print(f"[verbatim] Prealign manual adjust +1: side={side}, steps={self._prealign_manual_adjust_steps}")
 
     def _open_prealign_suggestions(self) -> None:
+        self._legacy_open_prealign_suggestions()
+        return
         profiles = self._ensure_doc_profiles()
         if profiles is None:
             return
@@ -3080,7 +3223,7 @@ class MainWindow(QMainWindow):
         left_p, right_p, left_bbox, right_bbox, score, reason = items_payload[idx]
         self._apply_prealign_candidate(left_p, right_p, left_bbox, right_bbox, score, reason)
 
-    def _ensure_doc_profiles(self) -> tuple[object, object] | None:
+    def _legacy_ensure_doc_profiles(self) -> tuple[DocumentProfile, DocumentProfile] | None:
         if self._left_pdf is None or self._right_pdf is None:
             QMessageBox.warning(self, "预对齐建议", "请先加载左右文档。")
             return None
@@ -3102,8 +3245,8 @@ class MainWindow(QMainWindow):
             return None
         return self._left_doc_profile, self._right_doc_profile
 
-    def _open_prealign_suggestions(self) -> None:
-        profiles = self._ensure_doc_profiles()
+    def _legacy_open_prealign_suggestions(self) -> None:
+        profiles = self._legacy_ensure_doc_profiles()
         if profiles is None:
             return
         left_idx = int(self._left_page_number)
@@ -3217,17 +3360,9 @@ class MainWindow(QMainWindow):
             return
 
         if left_page_idx != self._left_page_number:
-            self._left_page_number = int(left_page_idx)
-            self._left_page_combo.blockSignals(True)
-            self._left_page_combo.setCurrentIndex(self._left_page_number)
-            self._left_page_combo.blockSignals(False)
-            self._update_left_page()
+            self._set_page_index("left", left_page_idx)
         if right_page_idx != self._right_page_number:
-            self._right_page_number = int(right_page_idx)
-            self._right_page_combo.blockSignals(True)
-            self._right_page_combo.setCurrentIndex(self._right_page_number)
-            self._right_page_combo.blockSignals(False)
-            self._update_right_page()
+            self._set_page_index("right", right_page_idx)
 
         self._left_sel_bbox = left_bbox
         self._right_sel_bbox = right_bbox
@@ -3264,76 +3399,37 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _ocr_runtime_dir() -> Path | None:
-        raw = (os.getenv("VERBATIM_OCR_RUNTIME_DIR") or "").strip()
-        if raw:
-            p = Path(raw)
-            return p if p.exists() else None
-        local_default = Path.cwd() / "ocr_runtime"
-        if local_default.exists():
-            return local_default
-        if getattr(sys, "frozen", False):
-            exe_dir = Path(sys.executable).parent
-            external_default = exe_dir / "ocr_runtime"
-            if external_default.exists():
-                return external_default
-            internal_default = exe_dir / "_internal" / "ocr_runtime"
-            if internal_default.exists():
-                return internal_default
-        return None
+        return resolve_ocr_runtime_dir()
 
     @staticmethod
     def _ocr_json_exe_path() -> Path | None:
-        raw = (os.getenv("VERBATIM_PADDLEOCR_JSON_EXE") or "").strip()
-        if raw:
-            p = Path(raw)
-            return p if p.exists() else None
-        cache = getattr(MainWindow._ocr_json_exe_path, "_cache", None)
-        if cache:
-            cached_cwd = cache.get("cwd")
-            cached_path = cache.get("path")
-            if cached_cwd == Path.cwd() and cached_path:
-                cached = Path(cached_path)
-                if cached.exists():
-                    return cached
-        candidates = [
-            Path.cwd() / "ocr_runtime" / "PaddleOCR-json.exe",
-            Path.cwd() / "ocr_runtime" / "PaddleOCR-json" / "PaddleOCR-json.exe",
-        ]
-        if getattr(sys, "frozen", False):
-            exe_dir = Path(sys.executable).parent
-            candidates.extend(
-                [
-                    exe_dir / "ocr_runtime" / "PaddleOCR-json.exe",
-                    exe_dir / "ocr_runtime" / "PaddleOCR-json" / "PaddleOCR-json.exe",
-                    exe_dir / "_internal" / "ocr_runtime" / "PaddleOCR-json.exe",
-                    exe_dir / "_internal" / "ocr_runtime" / "PaddleOCR-json" / "PaddleOCR-json.exe",
-                ]
+        return resolve_ocr_json_exe_path()
+
+    def _get_local_ocr_self_check(self, *, force: bool = False) -> LocalOcrSelfCheck:
+        runtime_dir = self._ocr_runtime_dir()
+        json_exe = self._ocr_json_exe_path()
+        strict_offline = str(os.getenv("VERBATIM_OCR_OFFLINE_STRICT", "1")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        worker_python = LocalPaddleEngine.resolve_worker_python()
+        key = (
+            str(runtime_dir.resolve()) if runtime_dir is not None else "",
+            str(json_exe.resolve()) if json_exe is not None else "",
+            bool(strict_offline),
+            str(worker_python),
+        )
+        if force or self._local_ocr_self_check is None or self._local_ocr_self_check_key != key:
+            self._local_ocr_self_check = run_local_ocr_self_check(
+                runtime_dir=runtime_dir,
+                offline_strict=bool(strict_offline),
+                json_exe=json_exe,
+                worker_python=worker_python,
             )
-        for p in candidates:
-            if p.exists():
-                MainWindow._ocr_json_exe_path._cache = {"cwd": Path.cwd(), "path": str(p)}  # type: ignore[attr-defined]
-                return p
-        umi_root = Path.cwd() / "umi"
-        if getattr(sys, "frozen", False):
-            exe_dir = Path(sys.executable).parent
-            external_umi = exe_dir / "umi"
-            internal_umi = exe_dir / "_internal" / "umi"
-            if external_umi.exists():
-                umi_root = external_umi
-            elif internal_umi.exists():
-                umi_root = internal_umi
-        if umi_root.exists():
-            umi_patterns = [
-                "Umi-OCR*/UmiOCR-data/plugins/*PaddleOCR-json*/PaddleOCR-json.exe",
-                "*Umi-OCR*/UmiOCR-data/plugins/*PaddleOCR-json*/PaddleOCR-json.exe",
-                "UmiOCR-data/plugins/*PaddleOCR-json*/PaddleOCR-json.exe",
-            ]
-            for pattern in umi_patterns:
-                for p in umi_root.glob(pattern):
-                    if p.exists():
-                        MainWindow._ocr_json_exe_path._cache = {"cwd": Path.cwd(), "path": str(p)}  # type: ignore[attr-defined]
-                        return p
-        return None
+            self._local_ocr_self_check_key = key
+        return self._local_ocr_self_check
 
     def _get_local_ocr_engine(self) -> LocalPaddleEngine | None:
         runtime_dir = self._ocr_runtime_dir()
@@ -3394,12 +3490,13 @@ class MainWindow(QMainWindow):
             error=str(err),
         )
 
-    def _resolve_ocr_engines(self) -> list[tuple[str, object]]:
+    def _resolve_ocr_engines(self) -> list[tuple[str, OcrEngine]]:
         route = self._ocr_route_mode()
         cloud = self._get_cloud_ocr_engine()
         local_enabled = not self._local_ocr_breaker_open()
-        local_json = self._get_local_json_ocr_engine() if local_enabled else None
-        local = self._get_local_ocr_engine() if local_enabled else None
+        local_check = self._get_local_ocr_self_check()
+        local_json = self._get_local_json_ocr_engine() if local_enabled and local_check.json_ready else None
+        local = self._get_local_ocr_engine() if local_enabled and local_check.python_worker_ready else None
         if not local_enabled and not self._local_ocr_breaker_warned:
             remain = max(0, int(self._local_ocr_cooldown_until - time.monotonic()))
             msg = f"[verbatim] Local OCR breaker open: cooldown {remain}s, skip local engine."
@@ -3412,17 +3509,33 @@ class MainWindow(QMainWindow):
                 cooldown_left_sec=remain,
             )
             self._local_ocr_breaker_warned = True
+        if route in {"local_first", "local_only"} and not local_enabled:
+            return [("cloud", cloud)] if route == "local_first" and cloud is not None else []
+        if route in {"local_first", "local_only"} and not local_check.available:
+            msg = f"[verbatim] Local OCR self-check blocked: {local_check.code}: {local_check.message}"
+            print(msg)
+            log_event(
+                "OCR_LOCAL_SELF_CHECK_BLOCKED",
+                "local ocr self-check blocked engine resolution",
+                level="warning",
+                trace_id=self._trace_id,
+                reason_code=str(local_check.code),
+                reason_detail=str(local_check.message),
+            )
+            if route == "local_only":
+                return []
+            return [("cloud", cloud)] if cloud is not None else []
         if route == "cloud_only":
             return [("cloud", cloud)] if cloud is not None else []
         if route == "local_only":
-            engines = []
+            local_only_engines: list[tuple[str, OcrEngine]] = []
             if local_json is not None:
-                engines.append(("local_json", local_json))
+                local_only_engines.append(("local_json", local_json))
             if local is not None:
-                engines.append(("local", local))
-            return engines
+                local_only_engines.append(("local", local))
+            return local_only_engines
         # local_first
-        engines: list[tuple[str, object]] = []
+        engines: list[tuple[str, OcrEngine]] = []
         if local_json is not None:
             engines.append(("local_json", local_json))
         if local is not None:
@@ -3639,6 +3752,36 @@ class MainWindow(QMainWindow):
     def _get_cached_ocr_spans(self, cache_key: tuple[str, int, tuple[int, int, int, int], str]) -> list[OcrSpan]:
         return list(self._ocr_result_spans_cache.get(cache_key, []))
 
+    def _ocr_cached_coords_reliable(self, cache_key: tuple[str, int, tuple[int, int, int, int], str]) -> bool:
+        meta = self._ocr_result_spans_meta.get(cache_key) or {}
+        if "coords_reliable" in meta:
+            return bool(meta.get("coords_reliable"))
+        return bool(self._ocr_result_spans_cache.get(cache_key))
+
+    def _store_ocr_cache_result(
+        self,
+        *,
+        cache_key: tuple[str, int, tuple[int, int, int, int], str],
+        pdf_path: Path,
+        page_number: int,
+        result: OcrResult,
+        clip_bbox: BBox,
+        source_bbox: BBox,
+        coords_reliable: bool,
+    ) -> None:
+        self._ocr_result_cache[cache_key] = result
+        self._ocr_result_spans_meta[cache_key] = {
+            "pdf": str(pdf_path),
+            "page": int(page_number),
+            "clip_bbox": list(clip_bbox),
+            "source_bbox": list(source_bbox),
+            "coords_reliable": bool(coords_reliable),
+        }
+        if coords_reliable and result.spans:
+            self._ocr_result_spans_cache[cache_key] = list(result.spans)
+            return
+        self._ocr_result_spans_cache.pop(cache_key, None)
+
     def _run_in_background_with_ui_pump(self, fn, *args, timeout_ms: int | None = None, **kwargs):
         """Run blocking callable in a daemon thread while pumping UI events."""
         holder: dict[str, object] = {}
@@ -3679,7 +3822,7 @@ class MainWindow(QMainWindow):
             output_path = Path(output_file.name)
         input_path.write_bytes(pickle.dumps(payload))
         try:
-            py_exec = str(os.getenv("VERBATIM_WORKER_PYTHON", "")).strip()
+            py_exec = str(os.getenv("VERBATIM_BG_WORKER_PYTHON", "")).strip()
             if py_exec:
                 cmd = [
                     py_exec,
@@ -3795,7 +3938,7 @@ class MainWindow(QMainWindow):
                 {"zoom": 4.0, "padding": 4.0, "grayscale": True},
             ]
             best_result: OcrResult | None = None
-            best_score = -(10**9)
+            best_score = -1e9
             sync_to_async_used = False
             cloud_empty_file_seen = False
             cloud_timeout_seen = False
@@ -3908,7 +4051,7 @@ class MainWindow(QMainWindow):
                                 text=summarize_text(result.text or ""),
                             )
                             if getattr(result, "spans", None):
-                                candidate_spans = list(result.spans)
+                                candidate_spans = list(result.spans or ())
                                 for span in candidate_spans:
                                     t = span.text
                                     b = span.bbox
@@ -4069,6 +4212,7 @@ class MainWindow(QMainWindow):
                 q_best = self._check_text_quality(best_result.text)
                 garble_best, _ = self._garble_signal_score(best_result.text)
                 min_accept_score = float(os.getenv("VERBATIM_OCR_MIN_ACCEPT_SCORE", "45") or "45")
+                reference_accept_score = float(os.getenv("VERBATIM_OCR_REFERENCE_MIN_SCORE", "-55") or "-55")
                 ref_len = len((baseline_text or "").strip())
                 if ref_len <= 5:
                     min_accept_score = min(min_accept_score, 5.0)
@@ -4079,20 +4223,34 @@ class MainWindow(QMainWindow):
                         and best_result.text
                         and bool(os.getenv("VERBATIM_OCR_ACCEPT_LOW_SCORE_IF_EMPTY", "1") or "1")
                     ):
-                        print(f"[verbatim] OCR best {side_label} accepted (baseline empty): score={best_score:.1f}")
-                        self._ocr_result_cache[effective_cache_key] = best_result
-                        if best_result.spans:
-                            source_bbox = list(effective_cache_key[2]) if effective_cache_key else list(bbox)
-                            self._ocr_result_spans_cache[effective_cache_key] = list(best_result.spans)
-                            self._ocr_result_spans_meta[effective_cache_key] = {
-                                "pdf": str(pdf_path),
-                                "page": int(page_number),
-                                "clip_bbox": list(best_clip_bbox or last_clip_bbox or bbox),
-                                "source_bbox": source_bbox,
-                            }
-                        else:
-                            self._ocr_result_spans_cache.pop(effective_cache_key, None)
-                            self._ocr_result_spans_meta.pop(effective_cache_key, None)
+                        print(
+                            f"[verbatim] OCR best {side_label} accepted as text-only reference "
+                            f"(baseline empty): score={best_score:.1f}"
+                        )
+                        self._store_ocr_cache_result(
+                            cache_key=effective_cache_key,
+                            pdf_path=pdf_path,
+                            page_number=page_number,
+                            result=best_result,
+                            clip_bbox=best_clip_bbox or last_clip_bbox or bbox,
+                            source_bbox=cast(BBox, tuple(float(v) for v in bbox)),
+                            coords_reliable=False,
+                        )
+                        return best_result.text
+                    if best_score >= reference_accept_score and best_result.text and len_ratio <= 2.5:
+                        print(
+                            f"[verbatim] OCR best {side_label} accepted as text-only reference: "
+                            f"score={best_score:.1f}"
+                        )
+                        self._store_ocr_cache_result(
+                            cache_key=effective_cache_key,
+                            pdf_path=pdf_path,
+                            page_number=page_number,
+                            result=best_result,
+                            clip_bbox=best_clip_bbox or last_clip_bbox or bbox,
+                            source_bbox=cast(BBox, tuple(float(v) for v in bbox)),
+                            coords_reliable=False,
+                        )
                         return best_result.text
                     print(f"[verbatim] OCR best {side_label} rejected: score={best_score:.1f} < {min_accept_score:.1f}")
                     log_event(
@@ -4128,19 +4286,15 @@ class MainWindow(QMainWindow):
                     )
                 else:
                     print(f"[verbatim] OCR best {side_label}: {len(best_result.text)} chars, score={best_score:.1f}")
-                    self._ocr_result_cache[effective_cache_key] = best_result
-                    if best_result.spans:
-                        source_bbox = list(effective_cache_key[2]) if effective_cache_key else list(bbox)
-                        self._ocr_result_spans_cache[effective_cache_key] = list(best_result.spans)
-                        self._ocr_result_spans_meta[effective_cache_key] = {
-                            "pdf": str(pdf_path),
-                            "page": int(page_number),
-                            "clip_bbox": list(best_clip_bbox or last_clip_bbox or bbox),
-                            "source_bbox": source_bbox,
-                        }
-                    else:
-                        self._ocr_result_spans_cache.pop(effective_cache_key, None)
-                        self._ocr_result_spans_meta.pop(effective_cache_key, None)
+                    self._store_ocr_cache_result(
+                        cache_key=effective_cache_key,
+                        pdf_path=pdf_path,
+                        page_number=page_number,
+                        result=best_result,
+                        clip_bbox=best_clip_bbox or last_clip_bbox or bbox,
+                        source_bbox=cast(BBox, tuple(float(v) for v in bbox)),
+                        coords_reliable=bool(best_result.spans),
+                    )
                     log_event(
                         "OCR_BEST_ACCEPTED",
                         "ocr best candidate accepted",
@@ -4330,59 +4484,6 @@ class MainWindow(QMainWindow):
 
     def _check_text_quality(self, text: str) -> dict:
         return svc_check_text_quality(text)
-
-    def _sample_page_indices(self, page_count: int, max_samples: int = 5) -> list[int]:
-        if page_count <= 0:
-            return []
-        if page_count <= max_samples:
-            return list(range(page_count))
-        positions = [0.0, 0.25, 0.5, 0.75, 1.0]
-        idxs = sorted({min(page_count - 1, int(round((page_count - 1) * p))) for p in positions})
-        return idxs[:max_samples]
-
-    def _assess_pdf_side_quality(self, pdf_path: Path, page_count: int, side: str) -> tuple[bool, str]:
-        """Assess document-level text-layer quality and decide whether to force OCR."""
-        sample_pages = self._sample_page_indices(page_count, max_samples=5)
-        if not sample_pages:
-            return False, f"{side}: 无可评估页面"
-
-        scanned_pages = 0
-        bad_pages = 0
-        warning_pages = 0
-
-        for p in sample_pages:
-            try:
-                page = parse_page(pdf_path, p)
-                text = "".join(ch.char for ch in page.text_chars)
-                if not text.strip():
-                    scanned_pages += 1
-                    continue
-                q = self._check_text_quality(text)
-                if q.get("quality") == "bad":
-                    bad_pages += 1
-                elif q.get("quality") == "warning":
-                    warning_pages += 1
-            except Exception:
-                bad_pages += 1
-
-        total = len(sample_pages)
-        force_ocr = False
-        reasons: list[str] = []
-        if scanned_pages >= max(1, total // 2):
-            force_ocr = True
-            reasons.append(f"扫描页占比高({scanned_pages}/{total})")
-        if bad_pages >= max(1, total // 3):
-            force_ocr = True
-            reasons.append(f"低质量页占比高({bad_pages}/{total})")
-        if (bad_pages + warning_pages) >= max(2, (2 * total) // 3):
-            force_ocr = True
-            reasons.append(f"质量告警页过多({bad_pages + warning_pages}/{total})")
-
-        if force_ocr:
-            note = f"{side}文档质量评估：建议默认OCR（{'; '.join(reasons)}）"
-        else:
-            note = f"{side}文档质量评估：文本层可用（样本页 {total}）"
-        return force_ocr, note
 
     def _assess_pdf_side_quality(self, pdf_path: Path, page_count: int, side: str) -> tuple[bool, str]:
         return self._run_process_task_with_ui_pump(
@@ -4739,6 +4840,18 @@ class MainWindow(QMainWindow):
                 and self._right_sel_bbox is not None
             )
             ocr_was_recommended = bool(left_try_ocr or right_try_ocr)
+            local_check = self._get_local_ocr_self_check()
+            if (
+                self._ocr_route_mode() in {"local_first", "local_only"}
+                and local_check is not None
+                and not local_check.available
+                and ocr_was_recommended
+            ):
+                local_runtime_note = (
+                    f"本地 OCR 不可用（{local_check.code}: {local_check.message}），"
+                    + ("已自动切云端" if self._ocr_route_mode() == "local_first" else "当前仅允许本地OCR")
+                )
+                self._last_quality_warnings = [*self._last_quality_warnings, local_runtime_note]
             has_ocr_config = bool(self._resolve_ocr_engines())
             ocr_result = run_ocr_fallback(
                 use_ocr=bool(use_ocr and can_run_ocr),
@@ -4790,6 +4903,7 @@ class MainWindow(QMainWindow):
                         "left",
                     )
                     left_spans = self._get_cached_ocr_spans(left_key)
+                    left_cached_coords_reliable = self._ocr_cached_coords_reliable(left_key)
                     self._last_left_spans = list(left_spans or [])
                     left_meta = self._ocr_result_spans_meta.get(left_key)
                     if left_spans:
@@ -4830,7 +4944,7 @@ class MainWindow(QMainWindow):
                             *self._last_quality_warnings,
                             "标注基于 OCR，文本存在差异，可能不完全准确（左侧）。",
                         ]
-                    if left_spans and not span_issues:
+                    if left_spans and not span_issues and left_cached_coords_reliable:
                         left_region = self._build_region_from_ocr_spans(left_spans, self._left_page_number)
                         left_coords_reliable = True
                         left_ocr_has_coords = True
@@ -4857,6 +4971,7 @@ class MainWindow(QMainWindow):
                         "right",
                     )
                     right_spans = self._get_cached_ocr_spans(right_key)
+                    right_cached_coords_reliable = self._ocr_cached_coords_reliable(right_key)
                     self._last_right_spans = list(right_spans or [])
                     right_meta = self._ocr_result_spans_meta.get(right_key)
                     if right_spans:
@@ -4897,7 +5012,7 @@ class MainWindow(QMainWindow):
                             *self._last_quality_warnings,
                             "标注基于 OCR，文本存在差异，可能不完全准确（右侧）。",
                         ]
-                    if right_spans and not span_issues:
+                    if right_spans and not span_issues and right_cached_coords_reliable:
                         right_region = self._build_region_from_ocr_spans(right_spans, self._right_page_number)
                         right_coords_reliable = True
                         right_ocr_has_coords = True
@@ -4997,6 +5112,8 @@ class MainWindow(QMainWindow):
                 ocr_state=self._last_ocr_state,
                 ocr_state_reason=str(self._last_ocr_state_reason),
                 ocr_error_codes=list(self._last_ocr_error_codes),
+                left_coords_reliable=bool(left_coords_reliable),
+                right_coords_reliable=bool(right_coords_reliable),
             )
             self._last_compare_decision_status = compare_status
             self._last_gate_reason = str(compare_status_note or "")
@@ -5014,7 +5131,7 @@ class MainWindow(QMainWindow):
                 self._last_quality_warnings = [*self._last_quality_warnings, compare_status_note]
 
             manual_review_confirmed = False
-            if compare_status != "PASS":
+            if compare_status == "REVIEW":
                 original_left_text = left_text
                 original_right_text = right_text
                 approved, confirmed_left_text, confirmed_right_text = self._run_manual_review_gate(
@@ -5049,6 +5166,7 @@ class MainWindow(QMainWindow):
                         "left",
                     )
                     left_spans = self._get_cached_ocr_spans(left_key)
+                    left_cached_coords_reliable = self._ocr_cached_coords_reliable(left_key)
                     self._last_left_spans = list(left_spans or [])
                     left_meta = self._ocr_result_spans_meta.get(left_key)
                     if left_spans:
@@ -5084,7 +5202,7 @@ class MainWindow(QMainWindow):
                             *self._last_quality_warnings,
                             "OCR spans 几何一致性校验失败（左侧），定位标注已禁用。",
                         ]
-                    if left_spans and not span_issues:
+                    if left_spans and not span_issues and left_cached_coords_reliable:
                         if not text_ok:
                             self._last_quality_warnings = [
                                 *self._last_quality_warnings,
@@ -5109,6 +5227,7 @@ class MainWindow(QMainWindow):
                         "right",
                     )
                     right_spans = self._get_cached_ocr_spans(right_key)
+                    right_cached_coords_reliable = self._ocr_cached_coords_reliable(right_key)
                     self._last_right_spans = list(right_spans or [])
                     right_meta = self._ocr_result_spans_meta.get(right_key)
                     if right_spans:
@@ -5144,7 +5263,7 @@ class MainWindow(QMainWindow):
                             *self._last_quality_warnings,
                             "OCR spans 几何一致性校验失败（右侧），定位标注已禁用。",
                         ]
-                    if right_spans and not span_issues:
+                    if right_spans and not span_issues and right_cached_coords_reliable:
                         if not text_ok:
                             self._last_quality_warnings = [
                                 *self._last_quality_warnings,
@@ -5375,8 +5494,11 @@ class MainWindow(QMainWindow):
                 base_summary = f"{base_summary} | 定位: 部分可定位"
             else:
                 base_summary = f"{base_summary} | 定位: 可定位"
-            if blocked_low_reliability or compare_status != "PASS":
+            if blocked_low_reliability or compare_status == "REVIEW":
                 summary_text = f"{base_summary} | 状态:{compare_status} | 可信度:低 | 结论:需人工复核"
+                summary_warn = True
+            elif compare_status == "REFERENCE_ONLY":
+                summary_text = f"{base_summary} | 状态:{compare_status} | 可信度:低 | 结论:仅供参考"
                 summary_warn = True
             else:
                 summary_text = f"{base_summary} | 状态:{compare_status} | 可信度:{rel}"
@@ -6134,15 +6256,12 @@ class MainWindow(QMainWindow):
 
         left_page = int(payload.get("left_page", self._left_page_number))
         right_page = int(payload.get("right_page", self._right_page_number))
-        self._left_page_number = max(0, min(left_page, max(0, self._left_page_count - 1)))
-        self._right_page_number = max(0, min(right_page, max(0, self._right_page_count - 1)))
-
-        self._left_page_combo.blockSignals(True)
-        self._left_page_combo.setCurrentIndex(self._left_page_number)
-        self._left_page_combo.blockSignals(False)
-        self._right_page_combo.blockSignals(True)
-        self._right_page_combo.setCurrentIndex(self._right_page_number)
-        self._right_page_combo.blockSignals(False)
+        self._left_page_number = self._clamp_page_index("left", left_page)
+        self._right_page_number = self._clamp_page_index("right", right_page)
+        self._left_committed_page_number = self._left_page_number
+        self._right_committed_page_number = self._right_page_number
+        self._sync_page_controls("left")
+        self._sync_page_controls("right")
 
         self._load_page_data()
         self._load_into_view(self.left_view, self._left_pdf, page_number=self._left_page_number, side="left")
@@ -6197,7 +6316,7 @@ class MainWindow(QMainWindow):
             self.right_view.set_hover_overlay(None)
         self._populate_diff_list(ops)
         summary_text = str(payload.get("summary", "已回放历史比对结果"))
-        summary_warn = "REVIEW" in str(payload.get("compare_status", ""))
+        summary_warn = str(payload.get("compare_status", "PASS")) != "PASS"
         self._last_compare_vm = CompareViewModel(
             summary=summary_text,
             warn=summary_warn,
@@ -6236,21 +6355,12 @@ class MainWindow(QMainWindow):
     def _load_selection(self, selection) -> None:
         """Load and display a saved selection."""
         # Set page numbers
-        self._left_page_number = selection.left_page
-        self._right_page_number = selection.right_page
-
-        # Update navigation controls
-        self._left_page_combo.blockSignals(True)
-        self._left_page_combo.setCurrentIndex(self._left_page_number)
-        self._left_page_combo.blockSignals(False)
-        self._btn_left_prev.setEnabled(self._left_page_number > 0)
-        self._btn_left_next.setEnabled(self._left_page_number < self._left_page_count - 1)
-
-        self._right_page_combo.blockSignals(True)
-        self._right_page_combo.setCurrentIndex(self._right_page_number)
-        self._right_page_combo.blockSignals(False)
-        self._btn_right_prev.setEnabled(self._right_page_number > 0)
-        self._btn_right_next.setEnabled(self._right_page_number < self._right_page_count - 1)
+        self._left_page_number = self._clamp_page_index("left", selection.left_page)
+        self._right_page_number = self._clamp_page_index("right", selection.right_page)
+        self._left_committed_page_number = self._left_page_number
+        self._right_committed_page_number = self._right_page_number
+        self._sync_page_controls("left")
+        self._sync_page_controls("right")
 
         # Load page data if needed
         self._load_page_data()
@@ -6264,6 +6374,10 @@ class MainWindow(QMainWindow):
             self.left_view.set_title(f"左侧: {self._left_pdf.name} (第{self._left_page_number + 1}页)")
         if self._right_pdf:
             self.right_view.set_title(f"右侧: {self._right_pdf.name} (第{self._right_page_number + 1}页)")
+
+        # Update UI
+        self._sync_page_controls("left")
+        self._sync_page_controls("right")
 
         # Render the pages
         if self._left_pdf:
@@ -6345,7 +6459,7 @@ class MainWindow(QMainWindow):
         left_rects = [rect for rect, color in left_overlays]
 
         # Group by color
-        color_groups = {}
+        color_groups: dict[tuple[int, int, int], dict[str, list[QRectF]]] = {}
         for rect, color in left_overlays + right_overlays:
             color_key = (color.red(), color.green(), color.blue())
             if color_key not in color_groups:

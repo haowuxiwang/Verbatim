@@ -28,6 +28,23 @@ Run the app:
 python main.py
 ```
 
+Bootstrap an isolated local OCR worker runtime:
+
+```powershell
+python scripts/setup_local_ocr_worker_env.py --venv-dir .venv-ocr
+python scripts/setup_local_ocr_worker_env.py --venv-dir .venv-ocr --install --disable-pip-config
+set VERBATIM_OCR_WORKER_PYTHON=%CD%\\.venv-ocr\\Scripts\\python.exe
+```
+
+If your environment injects `PIP_NO_INDEX=1` or a broken mirror, prefer `--disable-pip-config` so the OCR worker install uses the explicit index arguments from the script.
+`VERBATIM_OCR_WORKER_PYTHON` is only for the isolated OCR worker. General PDF parsing/rendering background tasks keep using the main app interpreter unless you explicitly set `VERBATIM_BG_WORKER_PYTHON`.
+
+If local OCR stays blocked, inspect the self-check directly:
+
+```powershell
+python main.py --local-ocr-self-check
+```
+
 Run tests:
 
 ```powershell
@@ -55,5 +72,5 @@ python build.py
 ## Current constraints
 
 - `app/main_window.py` is still oversized and only partially extracted.
-- `app.main_window` is still excluded from strict mypy coverage.
-- `python scripts/pyinstaller_release_gate.py --skip-exe-run` now includes a source-side business smoke, but it is still not a full frozen-app acceptance signal.
+- `python scripts/pyinstaller_release_gate.py --skip-exe-run` still skips frozen-app launch and local OCR validation; use the full gate after building an `.exe`.
+- Local PaddleOCR must run in an isolated Python runtime; the main development Python may be incompatible with Paddle/OpenCV ABI requirements.

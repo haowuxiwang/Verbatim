@@ -7,13 +7,16 @@ import site
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from core.ocr_client import PaddleOcrClient
 from core.services.ocr_models import OcrSpan
+
+if TYPE_CHECKING:
+    from core.ocr_client import PaddleOcrClient
 
 
 @dataclass(frozen=True)
@@ -22,6 +25,119 @@ class EngineResult:
     engine: str
     mode: str
     spans: tuple[OcrSpan, ...] | None = None
+
+
+@dataclass(frozen=True)
+class LocalOcrSelfCheck:
+    available: bool
+    code: str
+    message: str
+    worker_python: str
+    runtime_dir: str
+    json_exe: str
+    python_worker_ready: bool
+    json_ready: bool
+
+
+def resolve_ocr_runtime_dir() -> Path | None:
+    raw = (os.getenv("VERBATIM_OCR_RUNTIME_DIR") or "").strip()
+    if raw:
+        p = Path(raw)
+        if p.exists():
+            return p
+    local_default = Path.cwd() / "ocr_runtime"
+    if local_default.exists():
+        return local_default
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        external_default = exe_dir / "ocr_runtime"
+        if external_default.exists():
+            return external_default
+        internal_default = exe_dir / "_internal" / "ocr_runtime"
+        if internal_default.exists():
+            return internal_default
+    return None
+
+
+def resolve_ocr_json_exe_path() -> Path | None:
+    raw = (os.getenv("VERBATIM_PADDLEOCR_JSON_EXE") or "").strip()
+    if raw:
+        p = Path(raw)
+        if p.exists():
+            return p
+
+    frozen_mode = bool(getattr(sys, "frozen", False))
+    roots = [
+        Path.cwd(),
+        Path.cwd() / "umi",
+        Path.cwd() / "ocr_runtime",
+    ]
+    if frozen_mode:
+        exe_dir = Path(sys.executable).parent
+        roots.extend(
+            [
+                exe_dir,
+                exe_dir / "umi",
+                exe_dir / "ocr_runtime",
+                exe_dir / "_internal",
+                exe_dir / "_internal" / "umi",
+                exe_dir / "_internal" / "ocr_runtime",
+            ]
+        )
+
+    direct_names = [
+        "PaddleOCR-json.exe",
+        str(Path("PaddleOCR-json") / "PaddleOCR-json.exe"),
+    ]
+    for root in roots:
+        if not root.exists():
+            continue
+        for rel in direct_names:
+            candidate = root / rel
+            if candidate.exists():
+                return candidate
+
+    patterns = [
+        "Umi-OCR*/UmiOCR-data/plugins/*PaddleOCR-json*/PaddleOCR-json.exe",
+        "*Umi-OCR*/UmiOCR-data/plugins/*PaddleOCR-json*/PaddleOCR-json.exe",
+        "UmiOCR-data/plugins/*PaddleOCR-json*/PaddleOCR-json.exe",
+    ]
+    seen: set[Path] = set()
+    for root in roots:
+        if not root.exists() or root in seen:
+            continue
+        seen.add(root)
+        for pattern in patterns:
+            for candidate in root.glob(pattern):
+                if candidate.exists():
+                    return candidate
+        if frozen_mode and root in {exe_dir, exe_dir / "umi", exe_dir / "_internal", exe_dir / "_internal" / "umi"}:
+            for candidate in root.rglob("PaddleOCR-json.exe"):
+                if candidate.exists():
+                    return candidate
+    return None
+
+
+def _classify_local_runtime_failure(detail: str) -> tuple[str, str]:
+    msg = str(detail or "").strip()
+    lowered = msg.lower()
+    if (
+        "numpy 1.x cannot be run in" in lowered
+        or "_array_api not found" in lowered
+        or "numpy.core.multiarray failed to import" in lowered
+    ):
+        return (
+            "numpy_abi_mismatch",
+            "local OCR runtime is incompatible with NumPy 2.x; create an isolated OCR env with numpy<2",
+        )
+    if "no module named" in lowered or "modulenotfounderror" in lowered:
+        return (
+            "module_missing",
+            "local OCR runtime is missing required dependencies; install paddlepaddle/paddleocr/paddlex into the OCR env",
+        )
+    if not msg:
+        return "runtime_import", "local OCR dependency import failed"
+    return "runtime_import", msg
 
 
 class CloudPaddleEngine:
@@ -59,6 +175,7 @@ class CloudPaddleEngine:
 
 class LocalPaddleEngine:
     name = "local_paddle"
+    _SELF_CHECK_OK = "VERBATIM_LOCAL_OCR_SELF_CHECK_OK"
 
     def __init__(self, runtime_dir: Path | None = None, offline_strict: bool = True) -> None:
         self.runtime_dir = runtime_dir
@@ -72,6 +189,50 @@ class LocalPaddleEngine:
             "yes",
             "on",
         }
+
+    @staticmethod
+    def resolve_worker_python() -> str:
+        py_exec = str(os.getenv("VERBATIM_OCR_WORKER_PYTHON", "")).strip()
+        if py_exec:
+            return py_exec
+        py_exec = str(os.getenv("VERBATIM_WORKER_PYTHON", "")).strip()
+        if py_exec:
+            return py_exec
+        exe_name = Path(sys.executable).stem.lower()
+        if "python" in exe_name:
+            return sys.executable
+        return ""
+
+    @staticmethod
+    def _build_worker_command(
+        *,
+        worker_python: str,
+        image_path: Path | None = None,
+        runtime_dir: Path | None,
+        offline_strict: bool,
+        self_check: bool = False,
+    ) -> list[str]:
+        py_exec = str(worker_python or "").strip()
+        if py_exec:
+            cmd = [py_exec, "-m", "core.services.local_ocr_worker"]
+        else:
+            exe_name = Path(sys.executable).stem.lower()
+            if "python" in exe_name:
+                cmd = [sys.executable, "-m", "core.services.local_ocr_worker"]
+            else:
+                cmd = [sys.executable, "--local-ocr-worker"]
+        if self_check:
+            cmd.append("--self-check")
+        if image_path is not None:
+            cmd.extend(["--image", str(image_path)])
+        if runtime_dir is not None:
+            cmd.extend(["--runtime-dir", str(runtime_dir)])
+        cmd.extend(["--offline-strict", "1" if offline_strict else "0"])
+        return cmd
+
+    @classmethod
+    def _self_check_success_payload(cls) -> dict[str, Any]:
+        return {"ok": True, "code": cls._SELF_CHECK_OK}
 
     def _resolve_font_path(self) -> Path | None:
         if self.runtime_dir is None:
@@ -98,40 +259,67 @@ class LocalPaddleEngine:
                 return p
         return None
 
-    def _ensure_ocr(self):
-        if self._ocr is not None:
-            return self._ocr
-        if self._init_error:
-            raise RuntimeError(self._init_error)
+    @staticmethod
+    def _model_has_manifest(model_dir: Path | None) -> bool:
+        return bool(model_dir is not None and (model_dir / "inference.yml").exists())
 
+    def _validate_runtime_assets(self) -> tuple[str, str] | None:
+        if self.runtime_dir is None or not self.offline_strict:
+            return None
+        font_path = self._resolve_font_path()
+        if font_path is None:
+            return (
+                "runtime_missing",
+                "offline runtime missing font: expected simfang.ttf under runtime fonts/assets",
+            )
+        det_name = (os.getenv("VERBATIM_PADDLE_DET_MODEL") or "PP-OCRv5_mobile_det").strip()
+        rec_name = (os.getenv("VERBATIM_PADDLE_REC_MODEL") or "PP-OCRv5_mobile_rec").strip()
+        det_dir = self._resolve_model_dir(det_name)
+        rec_dir = self._resolve_model_dir(rec_name)
+        if det_dir is None or rec_dir is None:
+            return (
+                "model_missing",
+                f"offline runtime missing OCR model directories: det={det_name} ({det_dir}), rec={rec_name} ({rec_dir})",
+            )
+        if not self._model_has_manifest(det_dir) or not self._model_has_manifest(rec_dir):
+            return (
+                "model_missing",
+                f"offline runtime OCR models are incomplete: det_manifest={(det_dir / 'inference.yml')}, rec_manifest={(rec_dir / 'inference.yml')}",
+            )
+        return None
+
+    def _runtime_site_packages(self) -> Path | None:
+        if self.runtime_dir is None:
+            return None
+        py_path = self.runtime_dir / "site-packages"
+        if py_path.exists():
+            return py_path
+        return None
+
+    def _runtime_env_overrides(self) -> dict[str, str]:
+        overrides: dict[str, str] = {}
         if self.runtime_dir:
-            runtime = str(self.runtime_dir.resolve())
-            cache_dir = Path(runtime) / ".paddlex"
-            runtime_home = Path(runtime) / ".runtime_home"
+            runtime_dir = self.runtime_dir.resolve()
+            cache_dir = runtime_dir / ".paddlex"
+            runtime_home = runtime_dir / ".runtime_home"
             xdg_cache = runtime_home / ".cache"
             cache_dir.mkdir(parents=True, exist_ok=True)
             xdg_cache.mkdir(parents=True, exist_ok=True)
             runtime_home.mkdir(parents=True, exist_ok=True)
-            os.environ["HOME"] = str(runtime_home)
-            os.environ["USERPROFILE"] = str(runtime_home)
-            os.environ["XDG_CACHE_HOME"] = str(xdg_cache)
-            os.environ.setdefault("PADDLE_HOME", str(Path(runtime) / ".paddle"))
-            os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(cache_dir))
-            py_path = str(Path(runtime) / "site-packages")
-            if Path(py_path).exists():
-                existing = os.getenv("PYTHONPATH", "")
-                if py_path not in existing.split(os.pathsep):
-                    os.environ["PYTHONPATH"] = f"{py_path}{os.pathsep}{existing}" if existing else py_path
-                # Make runtime site-packages available for in-process import (frozen builds).
-                try:
-                    site.addsitedir(py_path)
-                except Exception:
-                    pass
-                if py_path not in sys.path:
-                    sys.path.insert(0, py_path)
+            overrides["HOME"] = str(runtime_home)
+            overrides["USERPROFILE"] = str(runtime_home)
+            overrides["XDG_CACHE_HOME"] = str(xdg_cache)
+            overrides["PADDLE_HOME"] = str(runtime_dir / ".paddle")
+            overrides["PADDLE_PDX_CACHE_HOME"] = str(cache_dir)
+            py_path = self._runtime_site_packages()
+            if py_path is not None:
+                existing = str(os.environ.get("PYTHONPATH", "") or "")
+                py_path_text = str(py_path)
+                if py_path_text not in existing.split(os.pathsep):
+                    overrides["PYTHONPATH"] = f"{py_path_text}{os.pathsep}{existing}" if existing else py_path_text
             font_path = self._resolve_font_path()
             if font_path is not None:
-                os.environ["PADDLE_PDX_LOCAL_FONT_FILE_PATH"] = str(font_path)
+                overrides["PADDLE_PDX_LOCAL_FONT_FILE_PATH"] = str(font_path)
             elif self.offline_strict:
                 raise RuntimeError(
                     "offline runtime missing font: expected simfang.ttf under "
@@ -141,45 +329,229 @@ class LocalPaddleEngine:
             raise RuntimeError(
                 "offline runtime dir not configured; set VERBATIM_OCR_RUNTIME_DIR or provide ./ocr_runtime"
             )
+        overrides.setdefault("PYTHONUTF8", "1")
+        overrides.setdefault("PYTHONIOENCODING", "utf-8")
+        return overrides
+
+    def _build_runtime_env(self, base_env: dict[str, str] | None = None) -> dict[str, str]:
+        env = dict(base_env or os.environ)
+        env.update(self._runtime_env_overrides())
+        return env
+
+    @contextmanager
+    def _runtime_import_context(self):
+        env_updates = self._runtime_env_overrides()
+        previous_env: dict[str, str | None] = {}
+        for key, value in env_updates.items():
+            previous_env[key] = os.environ.get(key)
+            os.environ[key] = value
+        original_sys_path = list(sys.path)
+        py_path = self._runtime_site_packages()
+        if py_path is not None:
+            py_path_text = str(py_path)
+            try:
+                site.addsitedir(py_path_text)
+            except Exception:
+                pass
+            if py_path_text not in sys.path:
+                sys.path.insert(0, py_path_text)
+        try:
+            yield
+        finally:
+            sys.path[:] = original_sys_path
+            for key, old_value in previous_env.items():
+                if old_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old_value
+
+    def _ensure_ocr(self):
+        if self._ocr is not None:
+            return self._ocr
+        if self._init_error:
+            raise RuntimeError(self._init_error)
 
         try:
-            from paddleocr import PaddleOCR  # type: ignore
-        except Exception as e:
-            for mod in ("paddleocr", "paddlex", "paddle"):
-                if mod in sys.modules:
-                    sys.modules.pop(mod, None)
-            self._init_error = f"local paddleocr import failed: {e}"
-            raise RuntimeError(self._init_error) from e
+            with self._runtime_import_context():
+                try:
+                    from paddleocr import PaddleOCR  # type: ignore
+                except Exception as e:
+                    for mod in ("paddleocr", "paddlex", "paddle"):
+                        if mod in sys.modules:
+                            sys.modules.pop(mod, None)
+                    self._init_error = f"local paddleocr import failed: {e}"
+                    raise RuntimeError(self._init_error) from e
 
-        det_name = (os.getenv("VERBATIM_PADDLE_DET_MODEL") or "PP-OCRv5_mobile_det").strip()
-        rec_name = (os.getenv("VERBATIM_PADDLE_REC_MODEL") or "PP-OCRv5_mobile_rec").strip()
-        cls_name = (os.getenv("VERBATIM_PADDLE_CLS_MODEL") or "").strip()
-        det_dir = self._resolve_model_dir(det_name)
-        rec_dir = self._resolve_model_dir(rec_name)
-        if self.offline_strict and (det_dir is None or rec_dir is None):
-            raise RuntimeError(
-                f"offline runtime missing OCR models: det={det_name} ({det_dir}), rec={rec_name} ({rec_dir})"
-            )
-        kwargs: dict[str, Any] = {
-            "text_detection_model_name": det_name,
-            "text_recognition_model_name": rec_name,
-            "use_doc_orientation_classify": False,
-            "use_doc_unwarping": False,
-            "use_textline_orientation": False,
-            "device": "cpu",
-        }
-        if det_dir is not None:
-            kwargs["text_detection_model_dir"] = str(det_dir)
-        if rec_dir is not None:
-            kwargs["text_recognition_model_dir"] = str(rec_dir)
-        if cls_name:
-            kwargs["textline_orientation_model_name"] = cls_name
-        try:
-            self._ocr = PaddleOCR(**kwargs)
+                det_name = (os.getenv("VERBATIM_PADDLE_DET_MODEL") or "PP-OCRv5_mobile_det").strip()
+                rec_name = (os.getenv("VERBATIM_PADDLE_REC_MODEL") or "PP-OCRv5_mobile_rec").strip()
+                cls_name = (os.getenv("VERBATIM_PADDLE_CLS_MODEL") or "").strip()
+                det_dir = self._resolve_model_dir(det_name)
+                rec_dir = self._resolve_model_dir(rec_name)
+                if self.offline_strict and (det_dir is None or rec_dir is None):
+                    raise RuntimeError(
+                        f"offline runtime missing OCR models: det={det_name} ({det_dir}), rec={rec_name} ({rec_dir})"
+                    )
+                kwargs: dict[str, Any] = {
+                    "text_detection_model_name": det_name,
+                    "text_recognition_model_name": rec_name,
+                    "use_doc_orientation_classify": False,
+                    "use_doc_unwarping": False,
+                    "use_textline_orientation": False,
+                    "device": "cpu",
+                }
+                if det_dir is not None:
+                    kwargs["text_detection_model_dir"] = str(det_dir)
+                if rec_dir is not None:
+                    kwargs["text_recognition_model_dir"] = str(rec_dir)
+                if cls_name:
+                    kwargs["textline_orientation_model_name"] = cls_name
+                self._ocr = PaddleOCR(**kwargs)
         except Exception as e:
             self._init_error = str(e)
             raise
         return self._ocr
+
+    def self_check(self, *, worker_python: str = "") -> LocalOcrSelfCheck:
+        runtime_text = str(self.runtime_dir.resolve()) if self.runtime_dir is not None else ""
+        json_text = ""
+        worker = str(worker_python or self.resolve_worker_python()).strip()
+        try:
+            env = self._build_runtime_env()
+        except Exception as e:
+            return LocalOcrSelfCheck(
+                available=False,
+                code="runtime_missing",
+                message=str(e),
+                worker_python=worker,
+                runtime_dir=runtime_text,
+                json_exe=json_text,
+                python_worker_ready=False,
+                json_ready=False,
+            )
+        runtime_issue = self._validate_runtime_assets()
+        if runtime_issue is not None:
+            code, message = runtime_issue
+            return LocalOcrSelfCheck(
+                available=False,
+                code=code,
+                message=message,
+                worker_python=worker,
+                runtime_dir=runtime_text,
+                json_exe=json_text,
+                python_worker_ready=False,
+                json_ready=False,
+            )
+
+        if not worker:
+            return LocalOcrSelfCheck(
+                available=False,
+                code="worker_missing",
+                message="local OCR worker python is not configured",
+                worker_python="",
+                runtime_dir=runtime_text,
+                json_exe=json_text,
+                python_worker_ready=False,
+                json_ready=False,
+            )
+
+        try:
+            proc = subprocess.run(
+                self._build_worker_command(
+                    worker_python=worker,
+                    runtime_dir=self.runtime_dir,
+                    offline_strict=self.offline_strict,
+                    self_check=True,
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=45.0,
+                check=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return LocalOcrSelfCheck(
+                available=False,
+                code="runtime_timeout",
+                message="local OCR worker self-check timed out",
+                worker_python=worker,
+                runtime_dir=runtime_text,
+                json_exe=json_text,
+                python_worker_ready=False,
+                json_ready=False,
+            )
+        except Exception as e:
+            code, message = _classify_local_runtime_failure(str(e))
+            return LocalOcrSelfCheck(
+                available=False,
+                code=code,
+                message=message,
+                worker_python=worker,
+                runtime_dir=runtime_text,
+                json_exe=json_text,
+                python_worker_ready=False,
+                json_ready=False,
+            )
+
+        if proc.returncode != 0:
+            payload = self._parse_worker_payload(proc.stdout)
+            detail = (proc.stderr or "").strip()
+            if isinstance(payload, dict):
+                payload_detail = str(payload.get("error") or "").strip()
+                if not detail:
+                    detail = payload_detail
+            if not detail:
+                detail = (proc.stdout or "").strip()
+            code, message = _classify_local_runtime_failure(detail)
+            return LocalOcrSelfCheck(
+                available=False,
+                code=code,
+                message=message,
+                worker_python=worker,
+                runtime_dir=runtime_text,
+                json_exe=json_text,
+                python_worker_ready=False,
+                json_ready=False,
+            )
+
+        payload = self._parse_worker_payload(proc.stdout)
+        if not payload.get("ok"):
+            detail = str(payload.get("error") or "local OCR worker self-check returned invalid payload")
+            code, message = _classify_local_runtime_failure(detail)
+            return LocalOcrSelfCheck(
+                available=False,
+                code=code,
+                message=message,
+                worker_python=worker,
+                runtime_dir=runtime_text,
+                json_exe=json_text,
+                python_worker_ready=False,
+                json_ready=False,
+            )
+        if str(payload.get("code") or "") != self._SELF_CHECK_OK:
+            return LocalOcrSelfCheck(
+                available=False,
+                code="runtime_import",
+                message="local OCR worker self-check did not confirm runtime readiness",
+                worker_python=worker,
+                runtime_dir=runtime_text,
+                json_exe=json_text,
+                python_worker_ready=False,
+                json_ready=False,
+            )
+
+        return LocalOcrSelfCheck(
+            available=True,
+            code="ready",
+            message="local OCR worker is ready",
+            worker_python=worker,
+            runtime_dir=runtime_text,
+            json_exe=json_text,
+            python_worker_ready=True,
+            json_ready=False,
+        )
 
     def recognize(
         self,
@@ -220,8 +592,9 @@ class LocalPaddleEngine:
                 return EngineResult(text=text, engine=self.name, mode="cpu-subproc", spans=spans)
 
             # Non-isolated fallback for compatibility.
-            ocr = self._ensure_ocr()
-            output = run_bg(ocr.predict, str(tmp), timeout_ms=timeout_ms)
+            with self._runtime_import_context():
+                ocr = self._ensure_ocr()
+                output = run_bg(ocr.predict, str(tmp), timeout_ms=timeout_ms)
             text = self._extract_local_text(output)
             return EngineResult(text=text, engine=self.name, mode="cpu", spans=None)
         finally:
@@ -231,24 +604,16 @@ class LocalPaddleEngine:
                 pass
 
     def _predict_via_subprocess(self, image_path: Path, *, timeout_ms: int) -> dict[str, Any]:
-        py_exec = str(os.getenv("VERBATIM_WORKER_PYTHON", "")).strip()
-        if py_exec:
-            cmd = [py_exec, "-m", "core.services.local_ocr_worker", "--image", str(image_path)]
-        else:
-            exe_name = Path(sys.executable).stem.lower()
-            if "python" in exe_name:
-                cmd = [sys.executable, "-m", "core.services.local_ocr_worker", "--image", str(image_path)]
-            else:
-                cmd = [sys.executable, "--local-ocr-worker", "--image", str(image_path)]
-        if self.runtime_dir is not None:
-            cmd.extend(["--runtime-dir", str(self.runtime_dir)])
-        cmd.extend(["--offline-strict", "1" if self.offline_strict else "0"])
+        cmd = self._build_worker_command(
+            worker_python=self.resolve_worker_python(),
+            image_path=image_path,
+            runtime_dir=self.runtime_dir,
+            offline_strict=self.offline_strict,
+        )
 
         timeout_sec = max(1.0, float(timeout_ms) / 1000.0)
         try:
-            env = dict(os.environ)
-            env.setdefault("PYTHONUTF8", "1")
-            env.setdefault("PYTHONIOENCODING", "utf-8")
+            env = self._build_runtime_env()
             proc = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -274,7 +639,7 @@ class LocalPaddleEngine:
                 or "unrecognized arguments: --local-ocr-worker" in detail
             ):
                 raise RuntimeError(
-                    "Local OCR worker bootstrap failed. Use the packaged worker entry or set VERBATIM_WORKER_PYTHON."
+                    "Local OCR worker bootstrap failed. Use the packaged worker entry or set VERBATIM_OCR_WORKER_PYTHON."
                 )
             raise RuntimeError(f"Local OCR subprocess failed: {detail}")
         if not payload.get("ok"):
@@ -346,7 +711,6 @@ class LocalPaddleOcrJsonEngine:
                 if candidate.exists():
                     return candidate
         return None
-
     def _normalize_config_arg(self, args: list[str]) -> list[str]:
         if not args:
             args = []
@@ -379,6 +743,36 @@ class LocalPaddleOcrJsonEngine:
             return args
         args[cfg_idx + 1] = str(cfg_path)
         return args
+
+    def self_check(self) -> tuple[bool, str, str]:
+        if not self.exe_path.exists():
+            return False, "json_missing", "PaddleOCR-json executable not found"
+        try:
+            proc = subprocess.run(
+                [str(self.exe_path), "--help"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15.0,
+                check=False,
+                cwd=str(self.exe_path.parent),
+            )
+        except subprocess.TimeoutExpired:
+            return False, "json_timeout", "PaddleOCR-json health check timed out"
+        except Exception as e:
+            return False, "json_launch_failed", f"PaddleOCR-json failed to launch: {e}"
+
+        output = "\n".join(x for x in (proc.stdout, proc.stderr) if x).strip()
+        if "PaddleOCR-json" not in output:
+            detail = output or f"exit={proc.returncode}"
+            return False, "json_invalid", f"PaddleOCR-json health check returned unexpected output: {detail}"
+
+        if proc.returncode not in {0, 1}:
+            detail = output or f"exit={proc.returncode}"
+            return False, "json_invalid", f"PaddleOCR-json health check failed: {detail}"
+        return True, "ready", "PaddleOCR-json is ready"
 
     def recognize(
         self,
@@ -465,3 +859,49 @@ class LocalPaddleOcrJsonEngine:
             if isinstance(obj, dict) and "code" in obj:
                 return obj
         return None
+
+
+def run_local_ocr_self_check(
+    *,
+    runtime_dir: Path | None,
+    offline_strict: bool,
+    json_exe: Path | None = None,
+    worker_python: str = "",
+) -> LocalOcrSelfCheck:
+    json_path = str(json_exe.resolve()) if json_exe is not None else ""
+    worker = str(worker_python or LocalPaddleEngine.resolve_worker_python()).strip()
+    python_check = LocalPaddleEngine(runtime_dir=runtime_dir, offline_strict=offline_strict).self_check(
+        worker_python=worker
+    )
+    json_ready = False
+    json_code = ""
+    json_message = ""
+    if json_exe is not None:
+        json_ready, json_code, json_message = LocalPaddleOcrJsonEngine(json_exe).self_check()
+    python_ready = bool(python_check.python_worker_ready)
+    available = bool(json_ready or python_ready)
+    if available:
+        if python_ready and json_ready:
+            message = "local OCR python worker and PaddleOCR-json are ready"
+        elif json_ready:
+            message = json_message or "PaddleOCR-json is ready"
+        else:
+            message = python_check.message
+        code = "ready"
+    else:
+        if python_check.code not in {"worker_missing", "runtime_import"} or not json_message:
+            message = python_check.message
+            code = python_check.code
+        else:
+            message = json_message
+            code = json_code or python_check.code
+    return LocalOcrSelfCheck(
+        available=available,
+        code=code,
+        message=message,
+        worker_python=worker,
+        runtime_dir=python_check.runtime_dir,
+        json_exe=json_path,
+        python_worker_ready=python_ready,
+        json_ready=json_ready,
+    )

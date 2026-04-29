@@ -9,6 +9,7 @@ Example (sample asset `samples/manual-verification/original.pdf`, page 1 == page
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -92,6 +93,37 @@ def _infer_style(font_name: str, flags: Any) -> StyleFlags:
     return StyleFlags(bold=bold, italic=italic)
 
 
+def _looks_like_path_noise_line(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+
+    lower = s.lower()
+    if lower.startswith(("http://", "https://", "file://", "data:image/")):
+        return True
+
+    path_markers = (
+        "/users/",
+        "\\users\\",
+        "/appdata/",
+        "\\appdata\\",
+        "/sdk_storage/",
+        "\\sdk_storage\\",
+        "/resources/images/",
+        "\\resources\\images\\",
+    )
+    if any(marker in lower for marker in path_markers):
+        return True
+
+    if re.search(r"(?:^|[\\/])img_v\d+_[^\\/\s]+\.(?:jpg|jpeg|png|webp|bmp|gif|svg)$", lower):
+        return True
+
+    if ("/" in s or "\\" in s) and re.search(r"\.(?:jpg|jpeg|png|webp|bmp|gif|svg)$", lower):
+        return True
+
+    return False
+
+
 def parse_page(file_path: str | Path, page_number: int) -> PageData:
     """Parse one page (0-based) into PageData with per-character CharData."""
     pdf_path = str(Path(file_path))
@@ -109,6 +141,7 @@ def parse_page(file_path: str | Path, page_number: int) -> PageData:
             if block.get("type") != 0:
                 continue  # non-text block
             for line in block.get("lines", []):
+                line_chars: list[tuple[str, BBox, str, str, float, RGB, StyleFlags]] = []
                 for span in line.get("spans", []):
                     font_name = _fix_font_mojibake(str(span.get("font", "")))
                     font_family = _normalize_font_family(font_name)
@@ -129,19 +162,26 @@ def parse_page(file_path: str | Path, page_number: int) -> PageData:
                             float(bbox_list[2]),
                             float(bbox_list[3]),
                         )
-                        chars.append(
-                            CharData(
-                                char=c,
-                                index=idx,
-                                bbox=bbox,
-                                font_name=font_name,
-                                font_family=font_family,
-                                size=size,
-                                color_rgb=color_rgb,
-                                style=style,
-                            )
+                        line_chars.append((c, bbox, font_name, font_family, size, color_rgb, style))
+
+                line_text = "".join(ch for ch, *_rest in line_chars).strip()
+                if _looks_like_path_noise_line(line_text):
+                    continue
+
+                for c, bbox, font_name, font_family, size, color_rgb, style in line_chars:
+                    chars.append(
+                        CharData(
+                            char=c,
+                            index=idx,
+                            bbox=bbox,
+                            font_name=font_name,
+                            font_family=font_family,
+                            size=size,
+                            color_rgb=color_rgb,
+                            style=style,
                         )
-                        idx += 1
+                    )
+                    idx += 1
 
         rect = page.rect
         return PageData(

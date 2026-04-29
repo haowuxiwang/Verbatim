@@ -28,6 +28,14 @@ def classify_ocr_error(err: Exception | str) -> OcrErrorInfo:
         return OcrErrorInfo(code="model", message=msg)
     if "model" in msg_lower and ("not found" in msg_lower or "missing" in msg_lower):
         return OcrErrorInfo(code="model", message=msg)
+    if (
+        "numpy 1.x cannot be run in" in msg_lower
+        or "_array_api not found" in msg_lower
+        or "numpy.core.multiarray failed to import" in msg_lower
+    ):
+        return OcrErrorInfo(code="numpy_abi_mismatch", message=msg)
+    if "no module named" in msg_lower or "modulenotfounderror" in msg_lower:
+        return OcrErrorInfo(code="module_missing", message=msg)
 
     if "paddleocr-json" in msg_lower or "paddleocr json" in msg_lower:
         return OcrErrorInfo(code="engine", message=msg)

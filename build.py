@@ -73,22 +73,21 @@ def check_output():
     print(f"\nExecutable created: {exe_path}")
     print(f"File size: {size_mb:.1f} MB")
 
-    # Do not probe the windowed GUI with `--help`: it can hang waiting for UI exit.
-    print("\nRunning packaged business smoke...")
+    print("\nRunning packaged release gate...")
     probe = subprocess.run(
-        [sys.executable, "scripts/frozen_business_smoke.py", "--exe", str(exe_path)],
+        [sys.executable, "scripts/pyinstaller_release_gate.py", "--exe", str(exe_path), "--skip-source-tests"],
         check=False,
         capture_output=True,
         text=True,
         timeout=120,
     )
     if probe.returncode == 0:
-        print("Packaged business smoke passed!")
+        print("Packaged release gate passed!")
         if probe.stdout.strip():
             print(probe.stdout.strip())
         return
 
-    print(f"Packaged business smoke failed with exit code {probe.returncode}")
+    print(f"Packaged release gate failed with exit code {probe.returncode}")
     if probe.stdout.strip():
         print(probe.stdout.strip())
     if probe.stderr.strip():

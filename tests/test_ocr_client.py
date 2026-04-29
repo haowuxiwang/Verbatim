@@ -19,6 +19,13 @@ class TestOcrClientHelpers(unittest.TestCase):
             if old is not None:
                 os.environ["VERBATIM_OCR_TOKEN"] = old
 
+    def test_config_from_env_marks_storage_mode(self):
+        with mock.patch.dict("os.environ", {"VERBATIM_OCR_TOKEN": "t1"}, clear=False):
+            cfg = OcrConfig.from_env()
+        self.assertIsNotNone(cfg)
+        assert cfg is not None
+        self.assertEqual(cfg.token_storage, "env")
+
     def test_extract_text_from_nested_response(self):
         sample = {
             "data": {
@@ -118,6 +125,8 @@ class TestOcrClientHelpers(unittest.TestCase):
             self.assertAlmostEqual(loaded.retry_backoff_sec, 1.5)
             self.assertEqual(loaded.proxy_url, "http://127.0.0.1:7890")
             self.assertEqual(loaded.source, "file")
+            expected_storage = "dpapi" if '"token_enc"' in path.read_text(encoding="utf-8") else "plain"
+            self.assertEqual(loaded.token_storage, expected_storage)
 
     @unittest.skipUnless(os.name == "nt", "DPAPI encryption is Windows-only")
     def test_config_file_uses_encrypted_token_on_windows(self):
@@ -205,6 +214,17 @@ class TestOcrClientHelpers(unittest.TestCase):
             "result": [
                 {
                     "value": "/c/Users/WuSiTan/AppData/Roaming/LarkShell/sdk_storage/abc/resources/images/img_v3_01_abcd.jpg"
+                }
+            ]
+        }
+        text = PaddleOcrClient._extract_text(sample)
+        self.assertEqual(text, "")
+
+    def test_extract_text_ignores_path_like_primary_text_values(self):
+        sample = {
+            "data": [
+                {
+                    "text": "/c/Users/WuSiTan/AppData/Roaming/LarkShell/sdk_storage/abc/resources/images/img_v3_01_abcd.jpg"
                 }
             ]
         }

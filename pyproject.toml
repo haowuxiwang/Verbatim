@@ -54,7 +54,3 @@ module = [
   "app.view_models",
 ]
 ignore_errors = false
-
-[[tool.mypy.overrides]]
-module = ["app.main_window"]
-ignore_errors = true

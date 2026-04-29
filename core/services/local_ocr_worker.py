@@ -129,15 +129,17 @@ def _extract_spans_from_output(obj) -> list[dict]:
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Local OCR isolated worker")
-    p.add_argument("--image", required=True, help="Path to rendered PNG image")
+    p.add_argument("--image", default="", help="Path to rendered PNG image")
     p.add_argument("--runtime-dir", default="", help="OCR runtime directory")
     p.add_argument("--offline-strict", default="1", help="1/0 strict offline checks")
+    p.add_argument("--self-check", action="store_true", help="Validate worker bootstrap and OCR runtime")
     return p.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = _parse_args(argv)
-    image_path = Path(str(args.image)).resolve()
+    image_raw = str(args.image or "").strip()
+    image_path = Path(image_raw).resolve() if image_raw else None
     runtime_raw = str(args.runtime_dir or "").strip()
     runtime_dir = Path(runtime_raw).resolve() if runtime_raw else None
     offline_strict = str(args.offline_strict).strip().lower() in {"1", "true", "yes", "on"}
@@ -148,6 +150,12 @@ def main(argv: list[str]) -> int:
             time.sleep(sleep_sec)
         eng = LocalPaddleEngine(runtime_dir=runtime_dir, offline_strict=offline_strict)
         ocr = eng._ensure_ocr()
+        if args.self_check:
+            print(json.dumps(LocalPaddleEngine._self_check_success_payload(), ensure_ascii=False))
+            return 0
+        if image_path is None:
+            print(json.dumps({"ok": False, "error": "missing --image for OCR worker run"}, ensure_ascii=False))
+            return 2
         output = ocr.predict(str(image_path))
         text = eng._extract_local_text(output)
         spans = _extract_spans_from_output(output)

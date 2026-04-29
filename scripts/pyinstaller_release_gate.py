@@ -107,6 +107,38 @@ def _run_business_smoke(root: Path, *, exe_path: Path | None) -> tuple[bool, str
     return proc.returncode == 0, tail
 
 
+def _run_local_ocr_smoke(exe_path: Path) -> tuple[bool, str]:
+    if not exe_path.exists():
+        return False, "exe_missing"
+    try:
+        proc = subprocess.run(
+            [str(exe_path), "--local-ocr-self-check"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "local_ocr_check_timeout"
+    output = (proc.stdout or "").strip().splitlines()
+    tail = "\n".join(output[-8:]) if output else ""
+    payload = None
+    for line in reversed(output):
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and "available" in obj:
+            payload = obj
+            break
+    if proc.returncode == 0 and isinstance(payload, dict) and bool(payload.get("available")):
+        return True, tail or "local_ocr_ready"
+    return False, tail or f"local_ocr_check_failed rc={proc.returncode}"
+
+
 def main() -> int:
     args = parse_args()
     root = Path.cwd()
@@ -124,6 +156,10 @@ def main() -> int:
     smoke_note = "skipped"
     if not args.skip_exe_run:
         smoke_ok, smoke_note = _smoke_run_exe(exe_path, int(args.startup_timeout_sec))
+    local_ocr_ok = True
+    local_ocr_note = "skipped"
+    if not args.skip_exe_run:
+        local_ocr_ok, local_ocr_note = _run_local_ocr_smoke(exe_path)
     business_ok = True
     business_note = "skipped"
     if not args.skip_business_smoke:
@@ -144,9 +180,11 @@ def main() -> int:
         "source_smoke_note": source_note,
         "business_smoke_ok": business_ok,
         "business_smoke_note": business_note,
+        "local_ocr_smoke_ok": local_ocr_ok,
+        "local_ocr_smoke_note": local_ocr_note,
         "smoke_ok": smoke_ok,
         "smoke_note": smoke_note,
-        "gate_pass": bool(req_ok and build_entry_ok and source_ok and business_ok and smoke_ok),
+        "gate_pass": bool(req_ok and build_entry_ok and source_ok and business_ok and local_ocr_ok and smoke_ok),
     }
     print("RELEASE_GATE " + json.dumps(result, ensure_ascii=False))
     return 0 if result.get("gate_pass") else 2

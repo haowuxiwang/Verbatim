@@ -9,7 +9,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from core.services.ocr_engines import CloudPaddleEngine, LocalPaddleEngine
+from core.services.ocr_engines import (
+    CloudPaddleEngine,
+    LocalPaddleEngine,
+    LocalPaddleOcrJsonEngine,
+    run_local_ocr_self_check,
+)
 
 
 class TestOcrEngines(unittest.TestCase):
@@ -75,6 +80,45 @@ class TestOcrEngines(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 eng._ensure_ocr()
 
+    def test_resolve_worker_python_prefers_ocr_specific_env(self):
+        with patch.dict(
+            os.environ,
+            {
+                "VERBATIM_OCR_WORKER_PYTHON": r"D:\ocr\python.exe",
+                "VERBATIM_WORKER_PYTHON": r"D:\legacy\python.exe",
+            },
+            clear=False,
+        ):
+            self.assertEqual(r"D:\ocr\python.exe", LocalPaddleEngine.resolve_worker_python())
+
+    def test_local_engine_self_check_does_not_pollute_host_environment(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime_dir = Path(td)
+            (runtime_dir / "assets" / "fonts").mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "assets" / "fonts" / "simfang.ttf").write_bytes(b"font")
+            for model_name in ("PP-OCRv5_mobile_det", "PP-OCRv5_mobile_rec"):
+                model_dir = runtime_dir / "models" / model_name
+                model_dir.mkdir(parents=True, exist_ok=True)
+                (model_dir / "inference.yml").write_text("ok", encoding="utf-8")
+            eng = LocalPaddleEngine(runtime_dir=runtime_dir, offline_strict=True)
+            cp = subprocess.CompletedProcess(
+                args=["python", "-m", "core.services.local_ocr_worker", "--self-check"],
+                returncode=0,
+                stdout='{"ok": true, "code": "VERBATIM_LOCAL_OCR_SELF_CHECK_OK"}\n',
+                stderr="",
+            )
+            old_home = os.environ.get("HOME")
+            old_userprofile = os.environ.get("USERPROFILE")
+            old_pythonpath = os.environ.get("PYTHONPATH")
+            before_sys_path = list(os.sys.path)
+            with patch("core.services.ocr_engines.subprocess.run", return_value=cp):
+                result = eng.self_check(worker_python="python")
+            self.assertTrue(result.available)
+            self.assertEqual(old_home, os.environ.get("HOME"))
+            self.assertEqual(old_userprofile, os.environ.get("USERPROFILE"))
+            self.assertEqual(old_pythonpath, os.environ.get("PYTHONPATH"))
+            self.assertEqual(before_sys_path, list(os.sys.path))
+
     def test_local_engine_uses_run_bg_with_timeout(self):
         class _FakeOcr:
             def predict(self, _path):
@@ -115,6 +159,32 @@ class TestOcrEngines(unittest.TestCase):
             )
         self.assertEqual("SUBPROC_OK", out.text)
         self.assertEqual("cpu-subproc", out.mode)
+
+    def test_local_engine_subprocess_injects_runtime_env_without_touching_host(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime_dir = Path(td)
+            (runtime_dir / "assets" / "fonts").mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "assets" / "fonts" / "simfang.ttf").write_bytes(b"font")
+            payload = json.dumps({"ok": True, "text": "SUBPROC_OK"})
+            cp = subprocess.CompletedProcess(args=["python"], returncode=0, stdout=f"{payload}\n", stderr="")
+            eng = LocalPaddleEngine(runtime_dir=runtime_dir, offline_strict=True)
+            old_home = os.environ.get("HOME")
+            old_userprofile = os.environ.get("USERPROFILE")
+            with patch("core.services.ocr_engines.subprocess.run", return_value=cp) as m_run:
+                out = eng.recognize(
+                    image_bytes=b"x" * 128,
+                    filename="a.png",
+                    mode="sync",
+                    run_bg=lambda fn, *a, **k: fn(*a, **k),
+                    timeout_ms=1200,
+                    allow_sync_to_async_retry=False,
+                )
+            self.assertEqual("SUBPROC_OK", out.text)
+            env = m_run.call_args.kwargs["env"]
+            self.assertIn("PADDLE_HOME", env)
+            self.assertIn("PADDLE_PDX_CACHE_HOME", env)
+            self.assertEqual(old_home, os.environ.get("HOME"))
+            self.assertEqual(old_userprofile, os.environ.get("USERPROFILE"))
         self.assertTrue(m_run.called)
         self.assertIn("-m", m_run.call_args.args[0])
 
@@ -161,6 +231,131 @@ class TestOcrEngines(unittest.TestCase):
                 timeout_ms=1000,
                 allow_sync_to_async_retry=False,
             )
+
+    def test_local_engine_self_check_reports_runtime_import_failure(self):
+        eng = LocalPaddleEngine(runtime_dir=None, offline_strict=False)
+        cp = subprocess.CompletedProcess(
+            args=["python", "-m", "core.services.local_ocr_worker", "--self-check"],
+            returncode=1,
+            stdout="",
+            stderr="numpy missing",
+        )
+        with patch("core.services.ocr_engines.subprocess.run", return_value=cp):
+            result = eng.self_check(worker_python="python")
+        self.assertFalse(result.available)
+        self.assertEqual("runtime_import", result.code)
+        self.assertIn("numpy missing", result.message)
+        self.assertIn("--self-check", " ".join(cp.args))
+
+    def test_local_engine_self_check_reports_numpy_abi_mismatch(self):
+        eng = LocalPaddleEngine(runtime_dir=None, offline_strict=False)
+        cp = subprocess.CompletedProcess(
+            args=["python", "-m", "core.services.local_ocr_worker", "--self-check"],
+            returncode=1,
+            stdout='{"ok": false, "error": "A module that was compiled using NumPy 1.x cannot be run in NumPy 2.4.3"}\n',
+            stderr="A module that was compiled using NumPy 1.x cannot be run in NumPy 2.4.3\nImportError: numpy.core.multiarray failed to import",
+        )
+        with patch("core.services.ocr_engines.subprocess.run", return_value=cp):
+            result = eng.self_check(worker_python="python")
+        self.assertFalse(result.available)
+        self.assertEqual("numpy_abi_mismatch", result.code)
+        self.assertIn("numpy<2", result.message)
+
+    def test_local_engine_self_check_uses_real_worker_command(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime_dir = Path(td)
+            eng = LocalPaddleEngine(runtime_dir=runtime_dir, offline_strict=False)
+            cp = subprocess.CompletedProcess(
+                args=["python", "-m", "core.services.local_ocr_worker", "--self-check"],
+                returncode=0,
+                stdout='{"ok": true, "code": "VERBATIM_LOCAL_OCR_SELF_CHECK_OK"}\n',
+                stderr="",
+            )
+            with patch("core.services.ocr_engines.subprocess.run", return_value=cp) as m_run:
+                result = eng.self_check(worker_python="python")
+            self.assertTrue(result.available)
+            cmd = m_run.call_args.args[0]
+            self.assertIn("--self-check", cmd)
+            self.assertIn("--runtime-dir", cmd)
+            self.assertIn(str(runtime_dir), cmd)
+
+    def test_local_engine_self_check_requires_complete_runtime_models(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime_dir = Path(td)
+            (runtime_dir / "assets" / "fonts").mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "assets" / "fonts" / "simfang.ttf").write_bytes(b"font")
+            eng = LocalPaddleEngine(runtime_dir=runtime_dir, offline_strict=True)
+            result = eng.self_check(worker_python="python")
+        self.assertFalse(result.available)
+        self.assertEqual("model_missing", result.code)
+        self.assertIn("missing OCR model directories", result.message)
+
+    def test_local_engine_self_check_requires_inference_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime_dir = Path(td)
+            (runtime_dir / "assets" / "fonts").mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "assets" / "fonts" / "simfang.ttf").write_bytes(b"font")
+            (runtime_dir / "models" / "PP-OCRv5_mobile_det").mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "models" / "PP-OCRv5_mobile_rec").mkdir(parents=True, exist_ok=True)
+            eng = LocalPaddleEngine(runtime_dir=runtime_dir, offline_strict=True)
+            result = eng.self_check(worker_python="python")
+        self.assertFalse(result.available)
+        self.assertEqual("model_missing", result.code)
+        self.assertIn("incomplete", result.message)
+
+    def test_json_engine_self_check_validates_real_binary(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = Path(td) / "PaddleOCR-json.exe"
+            exe.write_bytes(b"fake")
+            engine = LocalPaddleOcrJsonEngine(exe)
+            cp = subprocess.CompletedProcess(
+                args=[str(exe), "--help"],
+                returncode=1,
+                stdout="PaddleOCR-json v1.4.1",
+                stderr="",
+            )
+            with patch("core.services.ocr_engines.subprocess.run", return_value=cp):
+                ready, code, message = engine.self_check()
+        self.assertTrue(ready)
+        self.assertEqual("ready", code)
+        self.assertIn("PaddleOCR-json", message)
+
+    def test_run_local_ocr_self_check_requires_json_health(self):
+        with tempfile.TemporaryDirectory() as td:
+            json_exe = Path(td) / "PaddleOCR-json.exe"
+            json_exe.write_bytes(b"fake")
+            cp = subprocess.CompletedProcess(args=[str(json_exe), "--help"], returncode=2, stdout="", stderr="bad launch")
+            with patch("core.services.ocr_engines.subprocess.run", return_value=cp):
+                result = run_local_ocr_self_check(
+                    runtime_dir=None,
+                    offline_strict=False,
+                    json_exe=json_exe,
+                    worker_python="",
+                )
+        self.assertFalse(result.available)
+        self.assertFalse(result.json_ready)
+        self.assertFalse(result.python_worker_ready)
+
+    def test_run_local_ocr_self_check_accepts_healthy_json_runtime_without_python_worker(self):
+        with tempfile.TemporaryDirectory() as td:
+            json_exe = Path(td) / "PaddleOCR-json.exe"
+            json_exe.write_bytes(b"fake")
+            cp = subprocess.CompletedProcess(
+                args=[str(json_exe), "--help"],
+                returncode=1,
+                stdout="PaddleOCR-json v1.4.1",
+                stderr="",
+            )
+            with patch("core.services.ocr_engines.subprocess.run", return_value=cp):
+                result = run_local_ocr_self_check(
+                    runtime_dir=None,
+                    offline_strict=False,
+                    json_exe=json_exe,
+                    worker_python="",
+                )
+        self.assertTrue(result.available)
+        self.assertTrue(result.json_ready)
+        self.assertFalse(result.python_worker_ready)
 
 
 if __name__ == "__main__":

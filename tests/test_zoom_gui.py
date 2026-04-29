@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import pickle
 import tempfile
 import time
 import unittest
@@ -10,13 +11,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from PySide6.QtCore import QRect, QRectF, Qt
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import QApplication, QListWidgetItem
 
 from app.main_window import ZOOM_MAX, ZOOM_MIN, MainWindow
 from core.compare_history import CompareHistoryManager
 from core.models import CharData, DiffOp, DiffOpType, PageData, RegionData, StyleFlags
 from core.ocr_client import OcrConfig
+from core.services.ocr_engines import EngineResult, LocalOcrSelfCheck
+from core.services.ocr_models import OcrSpan
 from core.services.ocr_state import OcrRunState
 
 
@@ -27,6 +30,17 @@ class TestZoomGui(unittest.TestCase):
 
     def setUp(self):
         self.w = MainWindow()
+        self._default_local_ocr_check = LocalOcrSelfCheck(
+            available=True,
+            code="ready",
+            message="ready",
+            worker_python="python",
+            runtime_dir="D:/ocr_runtime",
+            json_exe="D:/ocr_runtime/PaddleOCR-json.exe",
+            python_worker_ready=False,
+            json_ready=True,
+        )
+        self.w._get_local_ocr_self_check = lambda force=False: self._default_local_ocr_check
         self.w.show()
 
     def tearDown(self):
@@ -131,6 +145,23 @@ class TestZoomGui(unittest.TestCase):
         self.assertTrue(self.w._btn_compare.isEnabled())
         self.assertIn("已应用预对齐候选", self.w._last_compare_summary)
 
+    def test_open_prealign_suggestions_delegates_to_process_backed_path(self):
+        with patch.object(self.w, "_legacy_open_prealign_suggestions") as mocked:
+            self.w._open_prealign_suggestions()
+        mocked.assert_called_once_with()
+
+    def test_load_into_view_renders_real_pdf_into_scroll_view(self):
+        sample_pdf = next(Path(".").rglob("*艾曲泊帕乙醇胺片说明书批件*.pdf"))
+
+        self.w._load_into_view(self.w.left_view, sample_pdf, page_number=0, side="left")
+
+        pixmap = self.w.left_view._image.pixmap()
+        self.assertIsNotNone(pixmap)
+        assert pixmap is not None
+        self.assertFalse(pixmap.isNull())
+        self.assertIs(self.w.left_view._stack.currentWidget(), self.w.left_view._scroll)
+        self.assertNotIn("Failed to render", self.w.left_view._empty_hint.text())
+
     def test_set_result_summary_warn_style(self):
         self.w._set_result_summary("warning", warn=True)
         self.assertIn("warning", self.w._result_summary_bar.text())
@@ -173,14 +204,21 @@ class TestZoomGui(unittest.TestCase):
             self.assertTrue(self.w._btn_use_ocr.isEnabled())
             self.assertIn("本地优先", self.w._btn_use_ocr.toolTip())
 
-        self.w._ocr_cfg = OcrConfig(token="abc", source="file")
+        self.w._ocr_cfg = OcrConfig(token="abc", source="file", token_storage="plain")
         self._refresh_and_assert_cloud_config_present()
 
     def _refresh_and_assert_cloud_config_present(self):
         with patch.dict("os.environ", {"VERBATIM_OCR_ROUTE": "local_first"}):
             self.w._refresh_ocr_ui_state()
         self.assertTrue(self.w._btn_use_ocr.isEnabled())
+        self.assertIn("明文存储", self.w._ocr_token_status.text())
+        self.assertIn("明文存储", self.w._btn_use_ocr.toolTip())
         self.assertIn("已配置", self.w._ocr_token_status.text())
+
+    def test_build_ocr_storage_note(self):
+        self.assertIn("DPAPI", self.w._build_ocr_storage_note("dpapi"))
+        self.assertIn("明文", self.w._build_ocr_storage_note("plain"))
+        self.assertIn("环境变量", self.w._build_ocr_storage_note("env"))
 
     def test_local_ocr_breaker_skips_local_engine(self):
         self.w._local_ocr_fail_threshold = 2
@@ -228,15 +266,8 @@ class TestZoomGui(unittest.TestCase):
         self.assertEqual("ABC", "".join(ch.char for ch in region.chars))
         self.assertEqual(3, len(region.chars))
 
-    def test_sample_page_indices(self):
-        self.assertEqual([], self.w._sample_page_indices(0))
-        self.assertEqual([0, 1, 2], self.w._sample_page_indices(3))
-        idxs = self.w._sample_page_indices(17)
-        self.assertEqual(sorted(idxs), idxs)
-        self.assertLessEqual(len(idxs), 5)
-
     @unittest.skip("covered by process-backed quality assessment test")
-    def test_assess_pdf_side_quality_with_mocked_pages(self):
+    def test_assess_pdf_side_quality_with_process_result(self):
         p = self._make_page("text")
         blank = self._make_page("")
         with patch("app.main_window.parse_page", side_effect=[p, blank, p, p, p]):
@@ -385,6 +416,22 @@ class TestZoomGui(unittest.TestCase):
         self.assertEqual("REVIEW", status)
         self.assertIn("人工复核", note)
 
+    def test_compare_decision_status_reference_only_when_coords_unreliable(self):
+        status, note = self.w._compare_decision_status(
+            left_text="A",
+            right_text="B",
+            left_quality={"quality": "warning", "confidence": 76},
+            right_quality={"quality": "good", "confidence": 90},
+            ocr_used=True,
+            left_ocr_applied=True,
+            right_ocr_applied=False,
+            ocr_errors=[],
+            left_coords_reliable=False,
+            right_coords_reliable=True,
+        )
+        self.assertEqual("REFERENCE_ONLY", status)
+        self.assertIn("定位不可信", note)
+
     def test_compare_decision_status_pass_when_non_ocr(self):
         status, note = self.w._compare_decision_status(
             left_text="A",
@@ -416,15 +463,119 @@ class TestZoomGui(unittest.TestCase):
         self.assertEqual("REVIEW", status)
         self.assertIn("cannot_run", note)
 
+    def test_resolve_ocr_engines_skips_blocked_local_and_keeps_cloud(self):
+        fake_check = LocalOcrSelfCheck(
+            available=False,
+            code="runtime_import",
+            message="numpy missing",
+            worker_python="python",
+            runtime_dir="",
+            json_exe="",
+            python_worker_ready=False,
+            json_ready=False,
+        )
+        fake_cloud = object()
+        with (
+            patch.dict("os.environ", {"VERBATIM_OCR_ROUTE": "local_first"}, clear=False),
+            patch.object(self.w, "_get_local_ocr_self_check", return_value=fake_check),
+            patch.object(self.w, "_get_cloud_ocr_engine", return_value=fake_cloud),
+        ):
+            engines = self.w._resolve_ocr_engines()
+        self.assertEqual([("cloud", fake_cloud)], engines)
+
+    def test_refresh_ocr_ui_state_surfaces_blocked_local_runtime(self):
+        self.w._ocr_cfg = OcrConfig(
+            token="tok",
+            source="file",
+            token_storage="plain",
+        )
+        fake_check = LocalOcrSelfCheck(
+            available=False,
+            code="numpy_abi_mismatch",
+            message="local OCR runtime is incompatible with NumPy 2.x; create an isolated OCR env with numpy<2",
+            worker_python="python",
+            runtime_dir="D:/ocr_runtime",
+            json_exe="",
+            python_worker_ready=False,
+            json_ready=False,
+        )
+        with (
+            patch.dict("os.environ", {"VERBATIM_OCR_ROUTE": "local_first"}, clear=False),
+            patch.object(self.w, "_get_local_ocr_self_check", return_value=fake_check),
+        ):
+            self.w._refresh_ocr_ui_state()
+        self.assertIn("numpy<2", self.w._ocr_token_status.text())
+        self.assertIn("numpy<2", self.w._btn_use_ocr.toolTip())
+
     def test_render_zoom_for_side(self):
         self.w._left_zoom_ratio = 1.2
         self.w._right_zoom_ratio = 0.8
         self.assertGreater(self.w._render_zoom_for("left"), self.w._render_zoom_for("right"))
 
+    def test_load_selection_clamps_page_index_to_page_count_history_entry(self):
+        self.w._left_pdf = Path("left.pdf")
+        self.w._right_pdf = Path("right.pdf")
+        self.w._left_page_count = 14
+        self.w._right_page_count = 14
+        self.w._left_page_combo.clear()
+        self.w._right_page_combo.clear()
+        for i in range(14):
+            self.w._left_page_combo.addItem(f"第{i + 1}页")
+            self.w._right_page_combo.addItem(f"第{i + 1}页")
+
+        selection = SimpleNamespace(
+            left_page=16,
+            right_page=15,
+            left_bbox=(1.0, 2.0, 3.0, 4.0),
+            right_bbox=(5.0, 6.0, 7.0, 8.0),
+        )
+
+        with patch.object(self.w, "_load_page_data"), patch.object(self.w, "_load_into_view"):
+            self.w._load_selection(selection)
+
+        self.assertEqual(13, self.w._left_page_number)
+        self.assertEqual(13, self.w._right_page_number)
+        self.assertEqual(13, self.w._left_page_combo.currentIndex())
+        self.assertEqual(13, self.w._right_page_combo.currentIndex())
+
     def test_ocr_candidate_score_penalizes_weird_tokens(self):
         clean_score, _ = self.w._ocr_candidate_score("abcde")
         noisy_score, _ = self.w._ocr_candidate_score("ab1c2")
         self.assertGreater(clean_score, noisy_score)
+
+    def test_try_ocr_text_accepts_low_score_as_text_only_reference(self):
+        sample_pdf = next(Path(".").rglob("*艾曲泊帕乙醇胺片说明书批件*.pdf"))
+        cache_key = self.w._ocr_cache_key(sample_pdf, 0, (1.0, 2.0, 30.0, 40.0), "left")
+
+        class _FakeEngine:
+            def recognize(self, **kwargs):
+                return EngineResult(
+                    text="可读OCR文本" * 8,
+                    engine="fake",
+                    mode="sync",
+                    spans=(OcrSpan(text="可读OCR文本", bbox=(0.0, 0.0, 10.0, 5.0)),),
+                )
+
+        rendered = SimpleNamespace(image_bytes=b"\x89PNG" + b"0" * 128, clip_bbox=(0.0, 0.0, 100.0, 50.0), zoom=3.0)
+        with (
+            patch.object(self.w, "_resolve_ocr_engines", return_value=[("cloud", _FakeEngine())]),
+            patch.object(self.w, "_run_process_task_with_ui_pump", return_value=rendered),
+            patch.object(self.w, "_check_text_quality", return_value={"quality": "bad", "confidence": 35}),
+            patch.object(self.w, "_garble_signal_score", return_value=(3, ["garble"])),
+            patch.object(self.w, "_normalized_similarity", return_value=0.50),
+        ):
+            text = self.w._try_ocr_text(
+                sample_pdf,
+                0,
+                (1.0, 2.0, 30.0, 40.0),
+                "left",
+                baseline_text="基" * 56,
+                peer_text="",
+            )
+
+        self.assertTrue(text.startswith("可读OCR文本"))
+        self.assertEqual([], self.w._get_cached_ocr_spans(cache_key))
+        self.assertFalse(self.w._ocr_cached_coords_reliable(cache_key))
 
     def test_looks_like_path_text(self):
         self.assertTrue(self.w._looks_like_path_text("/sdk_storage/resources/images/img_v3_xxx.jpg"))
@@ -548,6 +699,43 @@ class TestZoomGui(unittest.TestCase):
         self.assertIsNone(self.w._last_left_region)
         self.assertIsNone(self.w._last_right_region)
         self.assertIsNone(self.w._focused_diff_op)
+
+    def test_update_left_page_drops_stale_render_and_commits_latest_target(self):
+        self.w._left_pdf = Path("dummy_left.pdf")
+        self.w._left_page_count = 3
+        self.w._left_page_number = 0
+        self.w._left_committed_page_number = 0
+        self.w._left_page_combo.clear()
+        for i in range(3):
+            self.w._left_page_combo.addItem(f"第{i + 1}页")
+
+        render_calls: list[int] = []
+
+        def fake_render(pdf_path, *, page_number=0, side="left"):
+            render_calls.append(page_number)
+            if page_number == 0 and len(render_calls) == 1:
+                self.w._set_page_index("left", 2)
+            pix = QPixmap(8, 8)
+            pix.fill()
+            return pix
+
+        def fake_task(task_name, *args, **kwargs):
+            self.assertEqual("parse_page", task_name)
+            return self._make_page(f"page-{int(args[1])}")
+
+        with (
+            patch.object(self.w, "_render_page_pixmap", side_effect=fake_render),
+            patch.object(self.w, "_run_process_task_with_ui_pump", side_effect=fake_task),
+            patch.object(self.w, "_apply_page_text_layer_status"),
+        ):
+            self.w._update_left_page()
+
+        self.assertEqual([0, 2], render_calls)
+        self.assertEqual(2, self.w._left_page_number)
+        self.assertEqual(2, self.w._left_committed_page_number)
+        self.assertFalse(self.w._left_nav_loading)
+        self.assertEqual(2, self.w._left_page_combo.currentIndex())
+        self.assertEqual("page-2", "".join(ch.char for ch in self.w._left_page.text_chars))
 
     def test_clear_cached_diff_result_clears_visual_badges(self):
         self.w.left_view.set_overlays([(QRectF(1.0, 1.0, 10.0, 10.0), QColor(255, 0, 0))])
@@ -722,10 +910,9 @@ class TestZoomGui(unittest.TestCase):
                             ):
                                 with patch("app.main_window.diff_regions", return_value=([op], norm_log)):
                                     with patch("app.main_window.run_field_mapping", return_value=field_result):
-                                        with patch(
-                                            "app.main_window.build_compare_result_summary", return_value="ocr-on"
-                                        ):
-                                            self.w._on_compare_clicked()
+                                        with patch("app.main_window.build_compare_result_summary", return_value="ocr-on"):
+                                            with patch.object(self.w, "_build_visual_diff_ops", return_value=[]):
+                                                self.w._on_compare_clicked()
 
         self.assertTrue(self.w._last_right_ocr_applied)
         self.assertFalse(self.w._last_left_ocr_applied)
@@ -884,6 +1071,53 @@ class TestZoomGui(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             self.w._run_process_task_with_ui_pump("sleep", 2.0, timeout_ms=200)
 
+    def test_background_process_task_ignores_legacy_ocr_worker_env(self):
+        captured: dict[str, object] = {}
+
+        class _FakeProc:
+            def __init__(self, cmd, **_kwargs):
+                captured["cmd"] = cmd
+                captured["kwargs"] = _kwargs
+                output_path = Path(cmd[cmd.index("--output") + 1])
+                output_path.write_bytes(pickle.dumps({"ok": True}))
+                self.returncode = 0
+
+            def poll(self):
+                return 0
+
+            def communicate(self):
+                return (b"", b"")
+
+        with patch.dict("os.environ", {"VERBATIM_WORKER_PYTHON": r"D:\ocr-only\python.exe"}, clear=False):
+            with patch("app.main_window.subprocess.Popen", side_effect=lambda *a, **k: _FakeProc(*a, **k)):
+                result = self.w._run_process_task_with_ui_pump("demo_task", timeout_ms=200)
+        self.assertEqual({"ok": True}, result)
+        cmd = captured["cmd"]
+        self.assertNotEqual(r"D:\ocr-only\python.exe", cmd[0])
+
+    def test_background_process_task_honors_bg_worker_env(self):
+        captured: dict[str, object] = {}
+
+        class _FakeProc:
+            def __init__(self, cmd, **_kwargs):
+                captured["cmd"] = cmd
+                captured["kwargs"] = _kwargs
+                output_path = Path(cmd[cmd.index("--output") + 1])
+                output_path.write_bytes(pickle.dumps({"ok": True}))
+                self.returncode = 0
+
+            def poll(self):
+                return 0
+
+            def communicate(self):
+                return (b"", b"")
+
+        with patch.dict("os.environ", {"VERBATIM_BG_WORKER_PYTHON": r"D:\bg\python.exe"}, clear=False):
+            with patch("app.main_window.subprocess.Popen", side_effect=lambda *a, **k: _FakeProc(*a, **k)):
+                result = self.w._run_process_task_with_ui_pump("demo_task", timeout_ms=200)
+        self.assertEqual({"ok": True}, result)
+        self.assertEqual(r"D:\bg\python.exe", captured["cmd"][0])
+
     def test_stale_diff_item_click_is_ignored(self):
         stale_op = DiffOp(
             type=DiffOpType.REPLACE,
@@ -918,13 +1152,13 @@ class TestZoomGui(unittest.TestCase):
 
     def test_sanitize_ocr_text_removes_path_noise(self):
         raw = (
-            "鑹炬洸娉婂笗涔欓唶鑳虹墖璇存槑涔?"
+            "艾曲泊帕乙醇胺片说明书 "
             "/c/Users/WuSiTan/AppData/Roaming/LarkShell/sdk_storage/abc/resources/images/img_v3_xxx.jpg "
             "请仔细阅读"
         )
         cleaned = self.w._sanitize_ocr_text(raw)
         self.assertIn("请仔细阅读", cleaned)
-        self.assertIn("请仔细阅读", cleaned)
+        self.assertIn("艾曲泊帕乙醇胺片说明书", cleaned)
         self.assertNotIn("sdk_storage", cleaned.lower())
         self.assertNotIn("img_v3_", cleaned.lower())
 
@@ -968,17 +1202,18 @@ class TestZoomGui(unittest.TestCase):
             submit_async=lambda *_args, **_kwargs: "jid",
             poll_async_result=lambda *_args, **_kwargs: fake_result,
         )
-        with patch.object(self.w, "_get_ocr_client", return_value=client):
-            with patch.object(self.w, "_run_in_background_with_ui_pump", side_effect=lambda fn, *a, **k: fn(*a, **k)):
-                with patch.object(self.w, "_current_ocr_mode", return_value="sync"):
-                    rendered = SimpleNamespace(image_bytes=b"x" * 256, clip_bbox=(0.0, 0.0, 10.0, 10.0), zoom=3.0)
-                    with patch.object(self.w, "_run_process_task_with_ui_pump", return_value=rendered):
-                        out = self.w._try_ocr_text(
-                            Path("dummy.pdf"),
-                            0,
-                            (0.0, 0.0, 10.0, 10.0),
-                            "right",
-                        )
+        with patch.dict("os.environ", {"VERBATIM_OCR_ROUTE": "cloud_only"}):
+            with patch.object(self.w, "_get_ocr_client", return_value=client):
+                with patch.object(self.w, "_run_in_background_with_ui_pump", side_effect=lambda fn, *a, **k: fn(*a, **k)):
+                    with patch.object(self.w, "_current_ocr_mode", return_value="sync"):
+                        rendered = SimpleNamespace(image_bytes=b"x" * 256, clip_bbox=(0.0, 0.0, 10.0, 10.0), zoom=3.0)
+                        with patch.object(self.w, "_run_process_task_with_ui_pump", return_value=rendered):
+                            out = self.w._try_ocr_text(
+                                Path("dummy.pdf"),
+                                0,
+                                (0.0, 0.0, 10.0, 10.0),
+                                "right",
+                            )
         self.assertEqual("CLOUD_TEXT", out)
 
     def test_try_ocr_text_cache_reuses_result_for_same_bbox(self):
@@ -994,13 +1229,14 @@ class TestZoomGui(unittest.TestCase):
             poll_async_result=lambda *_args, **_kwargs: SimpleNamespace(text="CACHE_TEXT"),
         )
         self.w._ocr_result_cache.clear()
-        with patch.object(self.w, "_get_ocr_client", return_value=client):
-            with patch.object(self.w, "_run_in_background_with_ui_pump", side_effect=lambda fn, *a, **k: fn(*a, **k)):
-                with patch.object(self.w, "_current_ocr_mode", return_value="sync"):
-                    rendered = SimpleNamespace(image_bytes=b"x" * 256, clip_bbox=(0.0, 0.0, 10.0, 10.0), zoom=3.0)
-                    with patch.object(self.w, "_run_process_task_with_ui_pump", return_value=rendered):
-                        out1 = self.w._try_ocr_text(Path("dummy.pdf"), 0, (0.0, 0.0, 10.0, 10.0), "right")
-                        out2 = self.w._try_ocr_text(Path("dummy.pdf"), 0, (0.0, 0.0, 10.0, 10.0), "right")
+        with patch.dict("os.environ", {"VERBATIM_OCR_ROUTE": "cloud_only"}):
+            with patch.object(self.w, "_get_ocr_client", return_value=client):
+                with patch.object(self.w, "_run_in_background_with_ui_pump", side_effect=lambda fn, *a, **k: fn(*a, **k)):
+                    with patch.object(self.w, "_current_ocr_mode", return_value="sync"):
+                        rendered = SimpleNamespace(image_bytes=b"x" * 256, clip_bbox=(0.0, 0.0, 10.0, 10.0), zoom=3.0)
+                        with patch.object(self.w, "_run_process_task_with_ui_pump", return_value=rendered):
+                            out1 = self.w._try_ocr_text(Path("dummy.pdf"), 0, (0.0, 0.0, 10.0, 10.0), "right")
+                            out2 = self.w._try_ocr_text(Path("dummy.pdf"), 0, (0.0, 0.0, 10.0, 10.0), "right")
         self.assertEqual("CACHE_TEXT", out1)
         self.assertEqual("CACHE_TEXT", out2)
         self.assertEqual(2, calls["n"])
