@@ -1335,5 +1335,116 @@ class TestZoomGui(unittest.TestCase):
         return RegionData(page_number=page_number, bboxes=[], chars=page.text_chars)
 
 
+SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples" / "manual-verification"
+ORIGINAL_PDF = SAMPLES_DIR / "original.pdf"
+DIGEST_PDF = SAMPLES_DIR / "digest.pdf"
+
+
+@unittest.skipUnless(ORIGINAL_PDF.exists() and DIGEST_PDF.exists(), "sample PDFs not found")
+class TestGuiEndToEndWithRealPdf(unittest.TestCase):
+    """End-to-end GUI test: load real PDFs, trigger compare, verify diff detection.
+
+    This test exercises the real pipeline (parse_page -> extract_region -> diff_regions)
+    through the MainWindow, with only OCR mocked out (since it requires external deps).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from core.pdf_parser import parse_page
+
+        self.w = MainWindow()
+        self.w._get_local_ocr_self_check = lambda force=False: LocalOcrSelfCheck(
+            available=True, code="ready", message="ready",
+            worker_python="python", runtime_dir="D:/ocr",
+            json_exe="D:/ocr/PaddleOCR-json.exe",
+            python_worker_ready=False, json_ready=True,
+        )
+
+        # Load real PDF pages
+        left_page = parse_page(ORIGINAL_PDF, 0)
+        right_page = parse_page(DIGEST_PDF, 1)  # page 0 is empty; page 1 has text
+
+        self.w._left_pdf = ORIGINAL_PDF
+        self.w._right_pdf = DIGEST_PDF
+        self.w._left_page_number = 0
+        self.w._right_page_number = 1
+        self.w._left_page = left_page
+        self.w._right_page = right_page
+        self.w._left_page_count = 1
+        self.w._right_page_count = 2
+
+        # Select the full page on both sides
+        self.w._left_sel_bbox = (0.0, 0.0, left_page.width, left_page.height)
+        self.w._right_sel_bbox = (0.0, 0.0, right_page.width, right_page.height)
+        self.w._update_compare_enabled()
+        self.w.show()
+
+    def tearDown(self):
+        self.w.close()
+
+    def test_real_pdf_compare_detects_differences(self):
+        """Compare two different PDFs and verify that diff ops are produced."""
+        self.assertTrue(self.w._btn_compare.isEnabled())
+
+        # Mock only OCR (external dependency), let real diff pipeline run
+        with patch("app.main_window.decide_ocr", return_value=SimpleNamespace(
+            left_try_ocr=False, right_try_ocr=False,
+            left_reason="text-layer-ok", right_reason="text-layer-ok",
+            recommended=False,
+        )):
+            with patch("app.main_window.run_ocr_fallback", return_value=SimpleNamespace(
+                left_text="", right_text="",
+                left_ocr_applied=False, right_ocr_applied=False,
+                ocr_used=False, replaced_sides=[],
+                attempted_but_empty=False, skipped_no_config=False,
+                ocr_note="",
+            )):
+                self.w._on_compare_clicked()
+
+        # Verify diff ops were produced
+        text_ops = [
+            o for o in self.w._last_diff_ops
+            if o.type in (DiffOpType.ADD, DiffOpType.DEL, DiffOpType.REPLACE)
+        ]
+        self.assertGreater(len(text_ops), 0, "different PDFs should produce text diff ops")
+
+        # Verify summary is not an error
+        self.assertNotIn("失败", self.w._last_compare_summary)
+        self.assertNotIn("error", self.w._last_compare_summary.lower())
+
+    def test_real_pdf_same_page_produces_zero_text_ops(self):
+        """Compare a page against itself — should produce no text diff ops."""
+        # Set both sides to the same page
+        from core.pdf_parser import parse_page
+
+        page = parse_page(ORIGINAL_PDF, 0)
+        self.w._right_page = page
+        self.w._right_page_number = 0
+        self.w._right_sel_bbox = (0.0, 0.0, page.width, page.height)
+
+        with patch("app.main_window.decide_ocr", return_value=SimpleNamespace(
+            left_try_ocr=False, right_try_ocr=False,
+            left_reason="text-layer-ok", right_reason="text-layer-ok",
+            recommended=False,
+        )):
+            with patch("app.main_window.run_ocr_fallback", return_value=SimpleNamespace(
+                left_text="", right_text="",
+                left_ocr_applied=False, right_ocr_applied=False,
+                ocr_used=False, replaced_sides=[],
+                attempted_but_empty=False, skipped_no_config=False,
+                ocr_note="",
+            )):
+                self.w._on_compare_clicked()
+
+        text_ops = [
+            o for o in self.w._last_diff_ops
+            if o.type in (DiffOpType.ADD, DiffOpType.DEL, DiffOpType.REPLACE)
+        ]
+        self.assertEqual(len(text_ops), 0, "same page should produce no text diff ops")
+
+
 if __name__ == "__main__":
     unittest.main()
