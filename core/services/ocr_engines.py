@@ -7,8 +7,8 @@ import site
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -45,10 +45,8 @@ def resolve_ocr_runtime_dir() -> Path | None:
         p = Path(raw)
         if p.exists():
             return p
-    local_default = Path.cwd() / "ocr_runtime"
-    if local_default.exists():
-        return local_default
-    if getattr(sys, "frozen", False):
+    frozen_mode = bool(getattr(sys, "frozen", False))
+    if frozen_mode:
         exe_dir = Path(sys.executable).parent
         external_default = exe_dir / "ocr_runtime"
         if external_default.exists():
@@ -56,6 +54,9 @@ def resolve_ocr_runtime_dir() -> Path | None:
         internal_default = exe_dir / "_internal" / "ocr_runtime"
         if internal_default.exists():
             return internal_default
+    local_default = Path.cwd() / "ocr_runtime"
+    if local_default.exists():
+        return local_default
     return None
 
 
@@ -67,11 +68,7 @@ def resolve_ocr_json_exe_path() -> Path | None:
             return p
 
     frozen_mode = bool(getattr(sys, "frozen", False))
-    roots = [
-        Path.cwd(),
-        Path.cwd() / "umi",
-        Path.cwd() / "ocr_runtime",
-    ]
+    roots: list[Path] = []
     if frozen_mode:
         exe_dir = Path(sys.executable).parent
         roots.extend(
@@ -84,6 +81,13 @@ def resolve_ocr_json_exe_path() -> Path | None:
                 exe_dir / "_internal" / "ocr_runtime",
             ]
         )
+    roots.extend(
+        [
+            Path.cwd(),
+            Path.cwd() / "umi",
+            Path.cwd() / "ocr_runtime",
+        ]
+    )
 
     direct_names = [
         "PaddleOCR-json.exe",
@@ -329,8 +333,8 @@ class LocalPaddleEngine:
             raise RuntimeError(
                 "offline runtime dir not configured; set VERBATIM_OCR_RUNTIME_DIR or provide ./ocr_runtime"
             )
-        overrides.setdefault("PYTHONUTF8", "1")
-        overrides.setdefault("PYTHONIOENCODING", "utf-8")
+        overrides["PYTHONUTF8"] = "1"
+        overrides["PYTHONIOENCODING"] = "utf-8"
         return overrides
 
     def _build_runtime_env(self, base_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -442,7 +446,8 @@ class LocalPaddleEngine:
                 json_ready=False,
             )
 
-        if not worker:
+        use_frozen_worker = bool(getattr(sys, "frozen", False)) and Path(sys.executable).suffix.lower() == ".exe"
+        if not worker and not use_frozen_worker:
             return LocalOcrSelfCheck(
                 available=False,
                 code="worker_missing",
@@ -570,7 +575,9 @@ class LocalPaddleEngine:
         try:
             if self._subprocess_isolation:
                 payload = self._predict_via_subprocess(tmp, timeout_ms=timeout_ms)
-                text = str(payload.get("text") or "").strip() if isinstance(payload, dict) else str(payload or "").strip()
+                text = (
+                    str(payload.get("text") or "").strip() if isinstance(payload, dict) else str(payload or "").strip()
+                )
                 spans_payload = payload.get("spans") if isinstance(payload, dict) else None
                 spans = None
                 if isinstance(spans_payload, list):
@@ -711,6 +718,7 @@ class LocalPaddleOcrJsonEngine:
                 if candidate.exists():
                     return candidate
         return None
+
     def _normalize_config_arg(self, args: list[str]) -> list[str]:
         if not args:
             args = []

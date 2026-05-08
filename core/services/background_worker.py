@@ -3,14 +3,15 @@ from __future__ import annotations
 import argparse
 import pickle
 import traceback
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from core.services.background_tasks import (
     assess_pdf_side_quality,
     build_document_profile_task,
-    compute_visual_diff,
     compute_prealign_payload,
+    compute_visual_diff,
     load_page_bundle,
     parse_page_task,
     render_page_png,

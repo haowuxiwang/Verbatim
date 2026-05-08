@@ -182,9 +182,7 @@ def populate_diff_lists(
 
     if quality_warnings:
         warning_header = QListWidgetItem("[!] quality warnings")
-        warning_header.setFlags(
-            warning_header.flags() & ~Qt.ItemFlag.ItemIsSelectable & ~Qt.ItemFlag.ItemIsEnabled
-        )
+        warning_header.setFlags(warning_header.flags() & ~Qt.ItemFlag.ItemIsSelectable & ~Qt.ItemFlag.ItemIsEnabled)
         warning_header.setForeground(QColor("#c0392b"))
         warning_header.setBackground(QColor("#fdf2f2"))
         content_diff_list.addItem(warning_header)

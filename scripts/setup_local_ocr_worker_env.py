@@ -9,6 +9,8 @@ import sys
 import venv
 from pathlib import Path
 
+PY311_REQUIREMENTS = "requirements-ocr-py311.txt"
+
 
 def _venv_python(venv_dir: Path) -> Path:
     if sys.platform.startswith("win"):
@@ -38,6 +40,18 @@ def _run(cmd: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> sub
         encoding="utf-8",
         errors="replace",
         check=False,
+    )
+
+
+def _validate_requirements_interpreter(requirements: Path) -> str | None:
+    if requirements.name != PY311_REQUIREMENTS:
+        return None
+    if sys.version_info[:2] == (3, 11):
+        return None
+    current = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    return (
+        f"{requirements.name} requires Python 3.11, but the current interpreter is {current}. "
+        "Use a Python 3.11 interpreter for this bootstrap or choose a requirements file that matches your interpreter."
     )
 
 
@@ -85,6 +99,14 @@ def main() -> int:
             "disable_pip_config": bool(args.disable_pip_config),
         },
     }
+
+    version_error = _validate_requirements_interpreter(requirements)
+    if version_error:
+        report["ready"] = False
+        report["error"] = version_error
+        report["python_version"] = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 2
 
     steps: list[dict[str, object]] = []
     if args.install:

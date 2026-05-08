@@ -6,7 +6,6 @@ from logging.handlers import RotatingFileHandler
 
 from core.app_paths import runtime_state_dir
 
-
 LOGGER_NAME = "verbatim.app"
 LOG_FILENAME = "verbatim_app.log"
 

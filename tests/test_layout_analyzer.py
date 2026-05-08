@@ -80,5 +80,69 @@ class TestLayoutAnalyzer(unittest.TestCase):
         self.assertEqual(info.layout_type, LayoutType.TWO_COLUMN)
 
 
+class TestLayoutAnalyzerAutoMode(unittest.TestCase):
+    """P1 Gap 6: Test layout detection for auto-mode decision logic.
+
+    _choose_best_auto_mode() in main_window.py tries multiple reading order
+    modes and picks the one with the most characters. These tests verify that
+    detect_layout() correctly identifies layouts for different character
+    distributions, which is the foundation of auto-mode.
+    """
+
+    def test_single_narrow_column_detected(self):
+        """Narrow text block (all chars in tight cluster) should be single-column."""
+        chars = []
+        idx = 0
+        for row in range(10):
+            y = 20.0 + row * 14.0
+            for col in range(3):
+                x = 280.0 + col * 10.0
+                chars.append(_ch("a", idx, x, y, x + 8.0, y + 10.0))
+                idx += 1
+        info = detect_layout(chars, page_width=600.0)
+        self.assertEqual(info.layout_type, LayoutType.SINGLE_COLUMN)
+
+    def test_wide_spread_chars_detected_as_two_column(self):
+        """Chars spread across the full page width should be two-column."""
+        chars = []
+        idx = 0
+        for row in range(20):
+            y = 20.0 + row * 14.0
+            # Left column
+            for col in range(4):
+                x = 40.0 + col * 14.0
+                chars.append(_ch("l", idx, x, y, x + 8.0, y + 10.0))
+                idx += 1
+            # Right column
+            for col in range(4):
+                x = 350.0 + col * 14.0
+                chars.append(_ch("r", idx, x, y, x + 8.0, y + 10.0))
+                idx += 1
+        info = detect_layout(chars, page_width=600.0)
+        self.assertEqual(info.layout_type, LayoutType.TWO_COLUMN)
+
+    def test_few_chars_fallback_to_single_column(self):
+        """Very few chars should not trigger two-column detection."""
+        chars = [
+            _ch("A", 0, 50.0, 20.0, 58.0, 30.0),
+            _ch("B", 1, 350.0, 20.0, 358.0, 30.0),
+        ]
+        info = detect_layout(chars, page_width=600.0)
+        # With only 2 chars, should not detect two-column.
+        self.assertEqual(info.layout_type, LayoutType.SINGLE_COLUMN)
+
+    def test_reading_order_preserves_left_to_right_within_column(self):
+        """Within a single column, reading order should be left-to-right, top-to-bottom."""
+        chars = [
+            _ch("B", 1, 80.0, 20.0, 88.0, 30.0),
+            _ch("A", 0, 50.0, 20.0, 58.0, 30.0),
+            _ch("C", 2, 50.0, 40.0, 58.0, 50.0),
+        ]
+        layout = LayoutInfo(LayoutType.SINGLE_COLUMN, 1, [], 1.0)
+        ordered = sort_chars_by_reading_order(chars, page_width=600.0, layout=layout)
+        text = "".join(c.char for c in ordered)
+        self.assertEqual(text, "ABC")
+
+
 if __name__ == "__main__":
     unittest.main()

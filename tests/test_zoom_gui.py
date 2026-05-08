@@ -910,7 +910,9 @@ class TestZoomGui(unittest.TestCase):
                             ):
                                 with patch("app.main_window.diff_regions", return_value=([op], norm_log)):
                                     with patch("app.main_window.run_field_mapping", return_value=field_result):
-                                        with patch("app.main_window.build_compare_result_summary", return_value="ocr-on"):
+                                        with patch(
+                                            "app.main_window.build_compare_result_summary", return_value="ocr-on"
+                                        ):
                                             with patch.object(self.w, "_build_visual_diff_ops", return_value=[]):
                                                 self.w._on_compare_clicked()
 
@@ -1204,7 +1206,9 @@ class TestZoomGui(unittest.TestCase):
         )
         with patch.dict("os.environ", {"VERBATIM_OCR_ROUTE": "cloud_only"}):
             with patch.object(self.w, "_get_ocr_client", return_value=client):
-                with patch.object(self.w, "_run_in_background_with_ui_pump", side_effect=lambda fn, *a, **k: fn(*a, **k)):
+                with patch.object(
+                    self.w, "_run_in_background_with_ui_pump", side_effect=lambda fn, *a, **k: fn(*a, **k)
+                ):
                     with patch.object(self.w, "_current_ocr_mode", return_value="sync"):
                         rendered = SimpleNamespace(image_bytes=b"x" * 256, clip_bbox=(0.0, 0.0, 10.0, 10.0), zoom=3.0)
                         with patch.object(self.w, "_run_process_task_with_ui_pump", return_value=rendered):
@@ -1231,7 +1235,9 @@ class TestZoomGui(unittest.TestCase):
         self.w._ocr_result_cache.clear()
         with patch.dict("os.environ", {"VERBATIM_OCR_ROUTE": "cloud_only"}):
             with patch.object(self.w, "_get_ocr_client", return_value=client):
-                with patch.object(self.w, "_run_in_background_with_ui_pump", side_effect=lambda fn, *a, **k: fn(*a, **k)):
+                with patch.object(
+                    self.w, "_run_in_background_with_ui_pump", side_effect=lambda fn, *a, **k: fn(*a, **k)
+                ):
                     with patch.object(self.w, "_current_ocr_mode", return_value="sync"):
                         rendered = SimpleNamespace(image_bytes=b"x" * 256, clip_bbox=(0.0, 0.0, 10.0, 10.0), zoom=3.0)
                         with patch.object(self.w, "_run_process_task_with_ui_pump", return_value=rendered):

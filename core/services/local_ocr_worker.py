@@ -151,10 +151,10 @@ def main(argv: list[str]) -> int:
         eng = LocalPaddleEngine(runtime_dir=runtime_dir, offline_strict=offline_strict)
         ocr = eng._ensure_ocr()
         if args.self_check:
-            print(json.dumps(LocalPaddleEngine._self_check_success_payload(), ensure_ascii=False))
+            print(json.dumps(LocalPaddleEngine._self_check_success_payload(), ensure_ascii=True))
             return 0
         if image_path is None:
-            print(json.dumps({"ok": False, "error": "missing --image for OCR worker run"}, ensure_ascii=False))
+            print(json.dumps({"ok": False, "error": "missing --image for OCR worker run"}, ensure_ascii=True))
             return 2
         output = ocr.predict(str(image_path))
         text = eng._extract_local_text(output)
@@ -162,15 +162,13 @@ def main(argv: list[str]) -> int:
         if str(os.getenv("VERBATIM_DEBUG_SPANS_TRACE", "0")).strip().lower() in {"1", "true", "yes", "on"}:
             try:
                 keys = sorted(output.keys()) if isinstance(output, dict) else []
-                sys.stderr.write(
-                    f"[worker] spans_count={len(spans)} keys={keys}\n"
-                )
+                sys.stderr.write(f"[worker] spans_count={len(spans)} keys={keys}\n")
             except Exception:
                 pass
-        print(json.dumps({"ok": True, "text": text, "spans": spans}, ensure_ascii=False))
+        print(json.dumps({"ok": True, "text": text, "spans": spans}, ensure_ascii=True))
         return 0
     except Exception as e:
-        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=True))
         return 2
 
 

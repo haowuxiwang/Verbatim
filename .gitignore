@@ -29,10 +29,17 @@ ocr_runtime/.runtime_home/
 # Large local-only inputs, outputs and artifacts
 umi/
 *.tar
+*.zip
 *.pdf
 !docs/**/*.pdf
 !samples/manual-verification/**/*.pdf
 local-artifacts/
+
+# Review and audit documents
+*审查*
+*review*
+*audit*
+/20??????*.md
 
 # Historical build specs kept outside the canonical build entry
 VerbatimDbg.spec

@@ -269,7 +269,12 @@ def _normalize_numbers(text: str) -> str:
 
     # Match: digit(s) followed by comma followed by exactly 3 digits
     # This is a simplified implementation
-    return re.sub(r"(\d),(\d{3})", r"\1\2", text)
+    # Iteratively remove thousand separators: 1,000,000 -> 1000000
+    prev = None
+    while prev != text:
+        prev = text
+        text = re.sub(r"(\d),(\d{3})", r"\1\2", text)
+    return text
 
 
 def _remove_punctuation(text: str) -> str:

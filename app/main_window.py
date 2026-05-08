@@ -23,7 +23,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 import fitz  # PyMuPDF
 from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, Qt, Signal, Slot
@@ -79,7 +79,6 @@ from core.ocr_client import (
     OcrConfig,
     PaddleOcrClient,
     default_ocr_config_path,
-    render_pdf_region_png_with_meta,
 )
 from core.pdf_parser import parse_page
 from core.region_extractor import extract_region
@@ -105,14 +104,18 @@ from core.services.ocr_errors import classify_ocr_error
 from core.services.ocr_models import OcrResult, OcrSpan
 from core.services.ocr_orchestrator import run_ocr_fallback
 from core.services.ocr_state import OcrRunState, compute_ocr_status
-from core.services.prealign import DocumentProfile, build_document_profile, retrieve_page_candidates, suggest_region_candidates
 from core.services.ocr_validation import (
     summarize_text,
     validate_ocr_input,
     validate_ocr_result,
     validate_ocr_spans,
 )
-from core.services.raster_diff import compute_visual_diff_payload
+from core.services.prealign import (
+    DocumentProfile,
+    build_document_profile,
+    retrieve_page_candidates,
+    suggest_region_candidates,
+)
 from core.services.text_quality import (
     check_text_quality as svc_check_text_quality,
 )
@@ -620,12 +623,6 @@ class MainWindow(QMainWindow):
         # Neutral gray ramp: #ecf0f1, #bdc3c7, #7f8c8d
         # ============================================
 
-        # Brand primary color: dark blue gray (#2c3e50)
-        # Accent color: deep blue (#2980b9), reserved for primary actions
-        # 涓€х伆闃讹細#ecf0f1, #bdc3c7, #7f8c8d
-
-        # Accent color: deep blue (#2980b9), only for primary actions
-        # Neutral gray ramp: #ecf0f1, #bdc3c7, #7f8c8d
         self.setStyleSheet("""
             /* Global typography: modern sans serif */
             QMainWindow {
@@ -897,6 +894,7 @@ class MainWindow(QMainWindow):
         self._last_ocr_error_codes: list[str] = []
         self._last_ocr_state = OcrRunState.BLOCKED
         self._last_ocr_state_reason = "unknown"
+        self._OCR_CACHE_MAX_SIZE = 128
         self._ocr_result_cache: dict[tuple[str, int, tuple[int, int, int, int], str], OcrResult] = {}
         self._ocr_result_spans_cache: dict[
             tuple[str, int, tuple[int, int, int, int], str],
@@ -1694,7 +1692,9 @@ class MainWindow(QMainWindow):
             self._btn_use_ocr.setEnabled(True)
             self._auto_ocr_enabled = True
             if cloud_ok:
-                self._btn_use_ocr.setToolTip(f"自动OCR回退已启用（当前配置来源：{src}，存储={storage_label}，路由={route}）")
+                self._btn_use_ocr.setToolTip(
+                    f"自动OCR回退已启用（当前配置来源：{src}，存储={storage_label}，路由={route}）"
+                )
                 self._ocr_token_status.setText(f"OCR Token: ● 已配置（{src}，{storage_label}）")
                 local_note = ""
                 if route in {"local_first", "local_only"} and local_check is not None and not local_check.available:
@@ -1913,7 +1913,9 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[verbatim] Failed to parse PDFs: {e}")
 
-    def _apply_page_text_layer_status(self, side: str, page_number: int, page: PageData | None, *, verbose: bool) -> None:
+    def _apply_page_text_layer_status(
+        self, side: str, page_number: int, page: PageData | None, *, verbose: bool
+    ) -> None:
         if page is None:
             return
         side_label = "Left" if side == "left" else "Right"
@@ -2413,8 +2415,7 @@ class MainWindow(QMainWindow):
         ready = (
             not self._left_nav_loading
             and not self._right_nav_loading
-            and
-            self._left_page is not None
+            and self._left_page is not None
             and self._right_page is not None
             and self._left_sel_bbox is not None
             and self._right_sel_bbox is not None
@@ -2599,7 +2600,9 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        tip = QLabel(f"当前结果低可信，必须人工确认后才能继续比对。\n触发原因：{reason}\n文本为只读确认，确认后继续可能仍有误差。")
+        tip = QLabel(
+            f"当前结果低可信，必须人工确认后才能继续比对。\n触发原因：{reason}\n文本为只读确认，确认后继续可能仍有误差。"
+        )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#7a4b00;background:#fff7e6;border:1px solid #ffd591;padding:8px;")
         layout.addWidget(tip)
@@ -3316,9 +3319,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(tip)
         summary = QLabel("Top-K 页候选：\n" + "\n".join(summary_lines))
         summary.setWordWrap(True)
-        summary.setStyleSheet(
-            "color:#2c3e50;font-size:12px;background:#f6f8fa;border:1px solid #e5e7eb;padding:6px;"
-        )
+        summary.setStyleSheet("color:#2c3e50;font-size:12px;background:#f6f8fa;border:1px solid #e5e7eb;padding:6px;")
         layout.addWidget(summary)
         lst = QListWidget()
         for idx, p in enumerate(items_payload, 1):
@@ -3769,6 +3770,13 @@ class MainWindow(QMainWindow):
         source_bbox: BBox,
         coords_reliable: bool,
     ) -> None:
+        # Evict oldest entry if cache is full (FIFO, dict preserves insertion order)
+        max_size = getattr(self, "_OCR_CACHE_MAX_SIZE", 128)
+        while len(self._ocr_result_cache) >= max_size:
+            oldest_key = next(iter(self._ocr_result_cache))
+            self._ocr_result_cache.pop(oldest_key, None)
+            self._ocr_result_spans_cache.pop(oldest_key, None)
+            self._ocr_result_spans_meta.pop(oldest_key, None)
         self._ocr_result_cache[cache_key] = result
         self._ocr_result_spans_meta[cache_key] = {
             "pdf": str(pdf_path),
@@ -3875,7 +3883,10 @@ class MainWindow(QMainWindow):
                         proc.wait(timeout=1.0)
                     except subprocess.TimeoutExpired:
                         proc.kill()
-                        proc.wait(timeout=1.0)
+                        try:
+                            proc.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            pass
                     timeout_sec = max(1, int(timeout_ms_final // 1000))
                     raise TimeoutError(f"Background process task timed out (>{timeout_sec}s): {task_name}")
                 time.sleep(0.03)
@@ -4239,8 +4250,7 @@ class MainWindow(QMainWindow):
                         return best_result.text
                     if best_score >= reference_accept_score and best_result.text and len_ratio <= 2.5:
                         print(
-                            f"[verbatim] OCR best {side_label} accepted as text-only reference: "
-                            f"score={best_score:.1f}"
+                            f"[verbatim] OCR best {side_label} accepted as text-only reference: score={best_score:.1f}"
                         )
                         self._store_ocr_cache_result(
                             cache_key=effective_cache_key,
@@ -4591,7 +4601,9 @@ class MainWindow(QMainWindow):
 
         return (len(reasons) == 0), reasons
 
-    def _log_spans_check(self, side: str, spans: list[OcrSpan], text_ok: bool, geom_ok: bool, reasons: list[str]) -> None:
+    def _log_spans_check(
+        self, side: str, spans: list[OcrSpan], text_ok: bool, geom_ok: bool, reasons: list[str]
+    ) -> None:
         span_count = len(spans or [])
         reason_txt = ",".join(reasons) if reasons else "ok"
         print(
@@ -4847,9 +4859,8 @@ class MainWindow(QMainWindow):
                 and not local_check.available
                 and ocr_was_recommended
             ):
-                local_runtime_note = (
-                    f"本地 OCR 不可用（{local_check.code}: {local_check.message}），"
-                    + ("已自动切云端" if self._ocr_route_mode() == "local_first" else "当前仅允许本地OCR")
+                local_runtime_note = f"本地 OCR 不可用（{local_check.code}: {local_check.message}），" + (
+                    "已自动切云端" if self._ocr_route_mode() == "local_first" else "当前仅允许本地OCR"
                 )
                 self._last_quality_warnings = [*self._last_quality_warnings, local_runtime_note]
             has_ocr_config = bool(self._resolve_ocr_engines())
@@ -4908,10 +4919,10 @@ class MainWindow(QMainWindow):
                     left_meta = self._ocr_result_spans_meta.get(left_key)
                     if left_spans:
                         self._last_left_spans_meta = left_meta or {
-                            'pdf': str(self._left_pdf),
-                            'page': int(self._left_page_number),
-                            'clip_bbox': list(self._left_sel_bbox or []),
-                            'source_bbox': list(self._left_sel_bbox or []),
+                            "pdf": str(self._left_pdf),
+                            "page": int(self._left_page_number),
+                            "clip_bbox": list(self._left_sel_bbox or []),
+                            "source_bbox": list(self._left_sel_bbox or []),
                         }
                     else:
                         self._last_left_spans_meta = None
@@ -4976,10 +4987,10 @@ class MainWindow(QMainWindow):
                     right_meta = self._ocr_result_spans_meta.get(right_key)
                     if right_spans:
                         self._last_right_spans_meta = right_meta or {
-                            'pdf': str(self._right_pdf),
-                            'page': int(self._right_page_number),
-                            'clip_bbox': list(self._right_sel_bbox or []),
-                            'source_bbox': list(self._right_sel_bbox or []),
+                            "pdf": str(self._right_pdf),
+                            "page": int(self._right_page_number),
+                            "clip_bbox": list(self._right_sel_bbox or []),
+                            "source_bbox": list(self._right_sel_bbox or []),
                         }
                     else:
                         self._last_right_spans_meta = None
@@ -5171,10 +5182,10 @@ class MainWindow(QMainWindow):
                     left_meta = self._ocr_result_spans_meta.get(left_key)
                     if left_spans:
                         self._last_left_spans_meta = left_meta or {
-                            'pdf': str(self._left_pdf),
-                            'page': int(self._left_page_number),
-                            'clip_bbox': list(self._left_sel_bbox or []),
-                            'source_bbox': list(self._left_sel_bbox or []),
+                            "pdf": str(self._left_pdf),
+                            "page": int(self._left_page_number),
+                            "clip_bbox": list(self._left_sel_bbox or []),
+                            "source_bbox": list(self._left_sel_bbox or []),
                         }
                     else:
                         self._last_left_spans_meta = None
@@ -5232,10 +5243,10 @@ class MainWindow(QMainWindow):
                     right_meta = self._ocr_result_spans_meta.get(right_key)
                     if right_spans:
                         self._last_right_spans_meta = right_meta or {
-                            'pdf': str(self._right_pdf),
-                            'page': int(self._right_page_number),
-                            'clip_bbox': list(self._right_sel_bbox or []),
-                            'source_bbox': list(self._right_sel_bbox or []),
+                            "pdf": str(self._right_pdf),
+                            "page": int(self._right_page_number),
+                            "clip_bbox": list(self._right_sel_bbox or []),
+                            "source_bbox": list(self._right_sel_bbox or []),
                         }
                     else:
                         self._last_right_spans_meta = None
@@ -5567,6 +5578,21 @@ class MainWindow(QMainWindow):
             if isinstance(getattr(self, "_compare_input_state", None), dict):
                 self._compare_input_state["_btn_save_selection"] = True
             self._btn_save_selection.setEnabled(True)
+        except Exception as exc:
+            log_event(
+                "CMP_ERROR",
+                "compare failed with exception",
+                level="error",
+                trace_id=self._trace_id,
+                error=str(exc),
+            )
+            from PySide6.QtWidgets import QMessageBox
+
+            QMessageBox.critical(
+                self,
+                "比对失败",
+                f"比对过程中发生错误：\n\n{exc}\n\n请检查 PDF 文件是否正常，或尝试重新选择区域。",
+            )
         finally:
             self._end_compare_feedback()
 
@@ -5823,20 +5849,20 @@ class MainWindow(QMainWindow):
             return False
 
     def _should_render_spans(self, side: str) -> bool:
-        spans = self._last_left_spans if side == 'left' else self._last_right_spans
+        spans = self._last_left_spans if side == "left" else self._last_right_spans
         if not spans:
             return False
-        meta = self._last_left_spans_meta if side == 'left' else self._last_right_spans_meta
+        meta = self._last_left_spans_meta if side == "left" else self._last_right_spans_meta
         if not meta:
             return True
-        pdf = self._left_pdf if side == 'left' else self._right_pdf
-        page = self._left_page_number if side == 'left' else self._right_page_number
+        pdf = self._left_pdf if side == "left" else self._right_pdf
+        page = self._left_page_number if side == "left" else self._right_page_number
         if not pdf:
             return False
-        if str(pdf) != str(meta.get('pdf') or '') or int(page) != int(meta.get('page', -1)):
+        if str(pdf) != str(meta.get("pdf") or "") or int(page) != int(meta.get("page", -1)):
             return False
-        sel = self._left_sel_bbox if side == 'left' else self._right_sel_bbox
-        source_bbox = meta.get('source_bbox') or meta.get('clip_bbox')
+        sel = self._left_sel_bbox if side == "left" else self._right_sel_bbox
+        source_bbox = meta.get("source_bbox") or meta.get("clip_bbox")
         if sel is None:
             return True
         return self._bbox_close(sel, source_bbox)
@@ -5844,9 +5870,9 @@ class MainWindow(QMainWindow):
     def _append_spans_unlocatable_warning(self, side: str, reason: str) -> None:
         label = "left" if side == "left" else "right"
         note = f"OCR spans generated but not locatable ({label}): {reason}"
-        if note in (getattr(self, '_last_quality_warnings', []) or []):
+        if note in (getattr(self, "_last_quality_warnings", []) or []):
             return
-        self._last_quality_warnings = [*getattr(self, '_last_quality_warnings', []), note]
+        self._last_quality_warnings = [*getattr(self, "_last_quality_warnings", []), note]
 
     def _render_spans_only(self) -> None:
         if not self._debug_spans:
@@ -5906,9 +5932,7 @@ class MainWindow(QMainWindow):
             coords_reliable=bool(
                 self._last_left_coords_reliable if side == "left" else self._last_right_coords_reliable
             ),
-            ocr_has_coords=bool(
-                self._last_left_ocr_has_coords if side == "left" else self._last_right_ocr_has_coords
-            ),
+            ocr_has_coords=bool(self._last_left_ocr_has_coords if side == "left" else self._last_right_ocr_has_coords),
         )
 
     def _unlocatable_badges(self, side: str, *, label: str = "OCR") -> list[tuple[QRectF, str, QColor]]:

@@ -9,7 +9,7 @@ from .diff_engine import _lcs_match_pairs, normalize_text
 from .format_diff import format_diff_regions
 from .models import CharData, DiffOp, DiffOpType, RegionData
 
-_ZERO_WIDTH = {"\u200b", "\u200c", "\u200d", "\u200e", "\u200f", "\u2060", "\ufeff"}
+_ZERO_WIDTH = {"​", "‌", "‎", "‏", "⁠", "﻿"}
 
 
 class NormalizationLog:

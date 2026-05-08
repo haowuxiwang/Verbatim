@@ -91,5 +91,47 @@ class TestRegionExtractor(unittest.TestCase):
         self.assertEqual([], reg.bboxes)
 
 
+class TestRegionExtractorEdgeCases(unittest.TestCase):
+    """P1 Gap 3 & 4: Empty page and synthetic coordinate handling."""
+
+    def test_empty_page_text_chars_returns_empty_region(self):
+        page = PageData(
+            file_path="mem://empty.pdf",
+            page_number=0,
+            width=600.0,
+            height=800.0,
+            text_chars=[],
+        )
+        region = extract_region(page, [(0.0, 0.0, 600.0, 800.0)])
+        self.assertEqual(len(region.chars), 0)
+        self.assertEqual(region.page_number, 0)
+
+    def test_no_bbox_overlap_returns_empty(self):
+        page = PageData(
+            file_path="mem://sparse.pdf",
+            page_number=0,
+            width=600.0,
+            height=800.0,
+            text_chars=[_mk_char("A", 0, 100, 100, 110, 110)],
+        )
+        # Bbox far from the character.
+        region = extract_region(page, [(0.0, 0.0, 10.0, 10.0)])
+        self.assertEqual(len(region.chars), 0)
+
+    def test_synthetic_sequential_bboxes_in_region(self):
+        # Simulate OCR-generated chars with sequential fake bboxes.
+        chars = [_mk_char(ch, i, float(i) * 9.0, 0.0, float(i) * 9.0 + 8.0, 12.0) for i, ch in enumerate("药品名称")]
+        page = PageData(
+            file_path="mem://ocr.pdf",
+            page_number=0,
+            width=600.0,
+            height=800.0,
+            text_chars=chars,
+        )
+        region = extract_region(page, [(0.0, 0.0, 600.0, 20.0)])
+        self.assertEqual(len(region.chars), 4)
+        self.assertEqual("".join(c.char for c in region.chars), "药品名称")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,8 @@ from core.services.ocr_engines import (
     CloudPaddleEngine,
     LocalPaddleEngine,
     LocalPaddleOcrJsonEngine,
+    resolve_ocr_json_exe_path,
+    resolve_ocr_runtime_dir,
     run_local_ocr_self_check,
 )
 
@@ -148,7 +150,7 @@ class TestOcrEngines(unittest.TestCase):
         payload = json.dumps({"ok": True, "text": "SUBPROC_OK"})
         cp = subprocess.CompletedProcess(args=["python"], returncode=0, stdout=f"noise\n{payload}\n", stderr="")
         eng = LocalPaddleEngine(runtime_dir=None, offline_strict=False)
-        with patch("core.services.ocr_engines.subprocess.run", return_value=cp) as m_run:
+        with patch("core.services.ocr_engines.subprocess.run", return_value=cp):
             out = eng.recognize(
                 image_bytes=b"x" * 128,
                 filename="a.png",
@@ -213,6 +215,63 @@ class TestOcrEngines(unittest.TestCase):
             ["D:/learn/codex/Verbatim_dev/dist/Verbatim/Verbatim.exe", "--local-ocr-worker", "--image"],
             m_run.call_args.args[0][:3],
         )
+
+    def test_local_engine_self_check_uses_frozen_worker_entry_when_python_not_overridden(self):
+        cp = subprocess.CompletedProcess(
+            args=["Verbatim.exe", "--local-ocr-worker", "--self-check"],
+            returncode=0,
+            stdout='{"ok": true, "code": "VERBATIM_LOCAL_OCR_SELF_CHECK_OK"}\n',
+            stderr="",
+        )
+        eng = LocalPaddleEngine(runtime_dir=None, offline_strict=False)
+        with (
+            patch("core.services.ocr_engines.subprocess.run", return_value=cp) as m_run,
+            patch("core.services.ocr_engines.sys.executable", "D:/learn/codex/Verbatim_dev/dist/Verbatim/Verbatim.exe"),
+            patch("core.services.ocr_engines.sys.frozen", True, create=True),
+        ):
+            result = eng.self_check(worker_python="")
+        self.assertTrue(result.available)
+        self.assertEqual(
+            ["D:/learn/codex/Verbatim_dev/dist/Verbatim/Verbatim.exe", "--local-ocr-worker", "--self-check"],
+            m_run.call_args.args[0][:3],
+        )
+
+    def test_resolve_ocr_runtime_dir_prefers_frozen_bundle_over_cwd(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cwd_runtime = root / "cwd" / "ocr_runtime"
+            exe_dir = root / "dist" / "Verbatim"
+            bundled_runtime = exe_dir / "ocr_runtime"
+            cwd_runtime.mkdir(parents=True)
+            bundled_runtime.mkdir(parents=True)
+            with (
+                patch("core.services.ocr_engines.Path.cwd", return_value=root / "cwd"),
+                patch("core.services.ocr_engines.sys.executable", str(exe_dir / "Verbatim.exe")),
+                patch("core.services.ocr_engines.sys.frozen", True, create=True),
+                patch.dict(os.environ, {}, clear=False),
+            ):
+                resolved = resolve_ocr_runtime_dir()
+        self.assertEqual(bundled_runtime, resolved)
+
+    def test_resolve_ocr_json_exe_path_prefers_frozen_bundle_over_cwd(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cwd = root / "cwd"
+            exe_dir = root / "dist" / "Verbatim"
+            cwd_json = cwd / "PaddleOCR-json.exe"
+            bundled_json = exe_dir / "PaddleOCR-json.exe"
+            cwd.mkdir(parents=True)
+            exe_dir.mkdir(parents=True)
+            cwd_json.write_bytes(b"cwd")
+            bundled_json.write_bytes(b"dist")
+            with (
+                patch("core.services.ocr_engines.Path.cwd", return_value=cwd),
+                patch("core.services.ocr_engines.sys.executable", str(exe_dir / "Verbatim.exe")),
+                patch("core.services.ocr_engines.sys.frozen", True, create=True),
+                patch.dict(os.environ, {}, clear=False),
+            ):
+                resolved = resolve_ocr_json_exe_path()
+        self.assertEqual(bundled_json, resolved)
 
     def test_local_engine_subprocess_mode_timeout(self):
         eng = LocalPaddleEngine(runtime_dir=None, offline_strict=False)
@@ -324,7 +383,9 @@ class TestOcrEngines(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             json_exe = Path(td) / "PaddleOCR-json.exe"
             json_exe.write_bytes(b"fake")
-            cp = subprocess.CompletedProcess(args=[str(json_exe), "--help"], returncode=2, stdout="", stderr="bad launch")
+            cp = subprocess.CompletedProcess(
+                args=[str(json_exe), "--help"], returncode=2, stdout="", stderr="bad launch"
+            )
             with patch("core.services.ocr_engines.subprocess.run", return_value=cp):
                 result = run_local_ocr_self_check(
                     runtime_dir=None,

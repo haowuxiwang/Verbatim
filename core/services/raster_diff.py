@@ -58,7 +58,9 @@ def compute_visual_diff_payload(
     confidence = min(0.99, diff_pixels / float(max(1, total_pixels)))
     return [
         {
-            "left_bbox": list(_map_canvas_bbox(diff_bbox, left_render.clip_bbox, left_scale, left_offset, left_img.size)),
+            "left_bbox": list(
+                _map_canvas_bbox(diff_bbox, left_render.clip_bbox, left_scale, left_offset, left_img.size)
+            ),
             "right_bbox": list(
                 _map_canvas_bbox(diff_bbox, right_render.clip_bbox, right_scale, right_offset, right_img.size)
             ),

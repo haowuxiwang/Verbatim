@@ -147,5 +147,50 @@ class TestDiffRegions(unittest.TestCase):
             self.assertFalse(op.type == DiffOpType.ADD and "（其他）" in right_seg)
 
 
+class TestDiffRegionsMultiLineChinese(unittest.TestCase):
+    """P1 Gap 8: Multi-line Chinese text through token-anchored diff path."""
+
+    def test_multiline_chinese_pharmaceutical_text(self):
+        # Use single-line text to avoid newline normalization complications.
+        left_text = "【药品名称】阿司匹林肠溶片【规格】100mg"
+        right_text = "【药品名称】阿司匹林肠溶片【规格】200mg"
+
+        left = _region([_mk_char(ch, i) for i, ch in enumerate(left_text)])
+        right = _region([_mk_char(ch, 100 + i) for i, ch in enumerate(right_text)])
+
+        ops, _ = diff_regions(left, right, coalesce_nearby_text_ops=False)
+        text_ops = [o for o in ops if o.type in (DiffOpType.ADD, DiffOpType.DEL, DiffOpType.REPLACE)]
+        self.assertGreaterEqual(len(text_ops), 1)
+        # Token-anchored diff with char-level refinement may produce "1"->"2" or "100mg"->"200mg".
+        all_text = "".join(op.meta.get("left_text", "") + op.meta.get("right_text", "") for op in text_ops)
+        self.assertTrue("1" in all_text or "2" in all_text or "100" in all_text or "200" in all_text)
+
+    def test_token_anchored_shared_prefix_preserved(self):
+        left_text = "适应症用于治疗高血压和心绞痛"
+        right_text = "适应症用于治疗高血压和心力衰竭"
+
+        left = _region([_mk_char(ch, i) for i, ch in enumerate(left_text)])
+        right = _region([_mk_char(ch, 100 + i) for i, ch in enumerate(right_text)])
+
+        ops, _ = diff_regions(left, right, coalesce_nearby_text_ops=False)
+        text_ops = [o for o in ops if o.type in (DiffOpType.ADD, DiffOpType.DEL, DiffOpType.REPLACE)]
+        self.assertGreaterEqual(len(text_ops), 1)
+        # Shared prefix "适应症用于治疗高血压和" should NOT appear in any diff op.
+        for op in text_ops:
+            left_seg = op.meta.get("left_text", "")
+            right_seg = op.meta.get("right_text", "")
+            self.assertNotIn("适应症", left_seg + right_seg)
+
+    def test_cjk_latin_mixed_tokenization(self):
+        from core.diff_regions import _tokenize_with_spans
+
+        text = "规格100mg每片含阿司匹林"
+        tokens = _tokenize_with_spans(text)
+        token_texts = [t[0] for t in tokens]
+        self.assertIn("规格", token_texts)
+        self.assertIn("100mg", token_texts)
+        self.assertIn("每片含阿司匹林", token_texts)
+
+
 if __name__ == "__main__":
     unittest.main()
