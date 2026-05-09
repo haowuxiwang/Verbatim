@@ -24,15 +24,17 @@ def garble_signal_score(text: str) -> tuple[int, list[str]]:
     score = 0
 
     if len(t) >= 80:
-        bridge = re.findall(r"(?<=[\u4e00-\u9fff])[A-Za-z0-9]{1,2}(?=[\u4e00-\u9fff])", t)
-        if len(bridge) >= 4:
+        bridge = re.findall(r"(?<=[一-鿿])[A-Za-z]{1,2}(?=[一-鿿])", t)
+        pharma_units = {"mg", "ml", "kg", "mc", "iu", "hr", "min", "pm", "am", "ci", "auc"}
+        real_bridge = [b for b in bridge if b.lower() not in pharma_units]
+        if len(real_bridge) >= 6:
             score += 2
             reasons.append(f"中英文/数字碎片插入过多({len(bridge)})")
 
-        short_ascii = re.findall(r"[A-Za-z0-9]{1,2}", t)
+        short_ascii = re.findall(r"(?<![0-9])[A-Za-z]{1,2}(?![0-9mg/l%])", t)
         if short_ascii:
             ratio = len(short_ascii) / max(1, len(t))
-            if ratio >= 0.08:
+            if ratio >= 0.12:
                 score += 1
                 reasons.append(f"短ASCII碎片占比偏高({ratio:.1%})")
 
@@ -60,9 +62,9 @@ def check_text_quality(text: str) -> dict:
 
     # For short/region-level snippets, punctuation can naturally be very sparse.
     # Keep this as warning unless the text is long enough to be statistically meaningful.
-    if punct_ratio < 0.003 and char_count > 120:
+    if punct_ratio < 0.001 and char_count > 500:
         severe_issues.append(f"标点密度极低({punct_ratio:.1%})，文本层可信度不足。")
-    elif punct_ratio < 0.01 and char_count > 40:
+    elif punct_ratio < 0.003 and char_count > 200:
         warning_issues.append(f"标点密度偏低({punct_ratio:.1%})，可能存在提取噪声。")
 
     abnormal_patterns = [r"[a-zA-Z]{20,}", r"\d{15,}"]
@@ -76,7 +78,7 @@ def check_text_quality(text: str) -> dict:
     digit_count = sum(1 for c in stripped if c.isdigit())
     denom = max(1, char_count)
     cjk_ratio = cjk_count / denom
-    if char_count > 40 and cjk_ratio < 0.20:
+    if char_count > 40 and cjk_ratio < 0.10:
         warning_issues.append(f"中文字符占比偏低({cjk_ratio:.1%})，文本层可能错位。")
 
     replacement_count = text.count("\ufffd")

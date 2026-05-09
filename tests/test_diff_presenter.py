@@ -4,7 +4,7 @@ import unittest
 
 from PySide6.QtWidgets import QApplication, QListWidget, QTabWidget
 
-from app.diff_presenter import build_diff_details_html, build_field_diff_details_html, populate_diff_lists
+from app.diff_presenter import _inline_char_diff_html, build_diff_details_html, build_field_diff_details_html, populate_diff_lists
 from app.view_models import CompareViewModel
 from core.field_mapper import FieldDiff
 from core.models import DiffOp, DiffOpType
@@ -26,8 +26,10 @@ class TestDiffPresenter(unittest.TestCase):
         )
         html = build_diff_details_html(op)
         self.assertIn("Content Changed", html)
-        self.assertIn("left text", html)
-        self.assertIn("right text", html)
+        # Inline char diff wraps differing chars in <span> tags.
+        self.assertIn("background:", html)
+        # Unchanged suffix "text" should still appear as plain text.
+        self.assertIn("text", html)
 
     def test_build_diff_details_html_for_visual_diff(self):
         op = DiffOp(
@@ -125,6 +127,92 @@ class TestDiffPresenter(unittest.TestCase):
         items = [content_list.item(i).text() for i in range(content_list.count())]
         self.assertTrue(any("basis=raster" in text for text in items))
         self.assertTrue(any("visual diff" in text.lower() for text in items))
+
+
+class TestInlineCharDiff(unittest.TestCase):
+    def test_single_char_replacement(self):
+        left_html, right_html = _inline_char_diff_html("100mg", "200mg")
+        # "1" deleted on left, "2" inserted on right, "00mg" unchanged
+        self.assertIn("background:#fdd", left_html)
+        self.assertIn("background:#dfd", right_html)
+        self.assertIn("00mg", left_html)
+        self.assertIn("00mg", right_html)
+
+    def test_multiple_changes(self):
+        left_html, right_html = _inline_char_diff_html("abcde", "axcye")
+        # "b" and "d" deleted on left; "x" and "y" inserted on right
+        self.assertIn("background:#fdd", left_html)
+        self.assertIn("background:#dfd", right_html)
+
+    def test_insertion(self):
+        left_html, right_html = _inline_char_diff_html("ac", "abc")
+        # "b" inserted on right side only
+        self.assertNotIn("background:#fdd", left_html)  # left has no deletions
+        self.assertIn("background:#dfd", right_html)
+
+    def test_deletion(self):
+        left_html, right_html = _inline_char_diff_html("abc", "ac")
+        # "b" deleted on left side only
+        self.assertIn("background:#fdd", left_html)
+        self.assertNotIn("background:#dfd", right_html)  # right has no insertions
+
+    def test_empty_strings(self):
+        left_html, right_html = _inline_char_diff_html("", "")
+        self.assertEqual(left_html, "")
+        self.assertEqual(right_html, "")
+
+    def test_one_empty(self):
+        left_html, right_html = _inline_char_diff_html("", "abc")
+        self.assertEqual(left_html, "<code></code>")
+        self.assertIn("background:#dfd", right_html)
+
+    def test_identical_strings(self):
+        left_html, right_html = _inline_char_diff_html("hello", "hello")
+        self.assertNotIn("background:", left_html)
+        self.assertNotIn("background:", right_html)
+        self.assertIn("hello", left_html)
+        self.assertIn("hello", right_html)
+
+    def test_long_text_truncation(self):
+        left = "a" * 100 + "X" + "b" * 200
+        right = "a" * 100 + "Y" + "b" * 200
+        left_html, right_html = _inline_char_diff_html(left, right)
+        # Should be truncated with ellipsis markers
+        self.assertIn("…", left_html)
+        self.assertIn("…", right_html)
+        # Changed chars should still be highlighted
+        self.assertIn("background:#fdd", left_html)
+        self.assertIn("background:#dfd", right_html)
+
+    def test_unicode_cjk(self):
+        left_html, right_html = _inline_char_diff_html("你好世界", "你好地球")
+        # "世界" vs "地球" — 4 chars all differ
+        self.assertIn("background:#fdd", left_html)
+        self.assertIn("background:#dfd", right_html)
+
+    def test_html_escaping(self):
+        left_html, right_html = _inline_char_diff_html("<b>", "<i>")
+        self.assertIn("&lt;", left_html)
+        self.assertIn("&gt;", left_html)
+        self.assertIn("&lt;", right_html)
+        self.assertIn("&gt;", right_html)
+        # No raw HTML tags from user text
+        self.assertNotIn("<b>", left_html)
+        self.assertNotIn("<i>", right_html)
+
+    def test_replace_branch_uses_inline_diff(self):
+        op = DiffOp(
+            type=DiffOpType.REPLACE,
+            left_indices=[0],
+            right_indices=[0],
+            left_bboxes=[],
+            right_bboxes=[],
+            meta={"left_text": "abc", "right_text": "axc"},
+        )
+        html = build_diff_details_html(op)
+        self.assertIn("Content Changed", html)
+        self.assertIn("background:#fdd", html)
+        self.assertIn("background:#dfd", html)
 
 
 if __name__ == "__main__":

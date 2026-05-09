@@ -18,6 +18,84 @@ def _preview(text: str, limit: int) -> str:
     return f"{text[:limit]}..."
 
 
+def _inline_char_diff_html(left: str, right: str) -> tuple[str, str]:
+    """Return (left_html, right_html) with per-character diff highlighting.
+
+    Differing characters are wrapped in ``<span>`` elements with background
+    colours: light-red for left-only (deleted), light-green for right-only
+    (inserted).  Unchanged characters are escaped but unstyled.
+
+    For long text (>200 chars) a context window of 40 chars around the first
+    and last difference is shown, with ``…`` markers for truncated regions.
+    """
+    from core.diff_engine import _lcs_match_pairs
+
+    if not left and not right:
+        return ("", "")
+
+    # Fast path: identical strings.
+    if left == right:
+        esc = escape(left)
+        return (f"<code>{esc}</code>", f"<code>{esc}</code>")
+
+    pairs = _lcs_match_pairs(left, right)
+
+    # Build per-character status: 0=matched, 1=left-only(deleted), 2=right-only(inserted)
+    left_status = [1] * len(left)   # default: deleted
+    right_status = [2] * len(right)  # default: inserted
+    for i, j in pairs:
+        left_status[i] = 0
+        right_status[j] = 0
+
+    # --- context window for long text ---
+    ctx = 40
+    if len(left) > 200 or len(right) > 200:
+        # Find first and last differing positions.
+        first_diff_l = next((k for k, s in enumerate(left_status) if s != 0), len(left))
+        first_diff_r = next((k for k, s in enumerate(right_status) if s != 0), len(right))
+        first_diff = min(first_diff_l, first_diff_r)
+
+        last_diff_l = len(left) - 1 - next(
+            (k for k, s in enumerate(reversed(left_status)) if s != 0), len(left)
+        )
+        last_diff_r = len(right) - 1 - next(
+            (k for k, s in enumerate(reversed(right_status)) if s != 0), len(right)
+        )
+        last_diff = max(last_diff_l, last_diff_r)
+
+        win_start = max(0, first_diff - ctx)
+        win_end = min(max(len(left), len(right)), last_diff + ctx + 1)
+
+        left_status = left_status[win_start:win_end]
+        right_status = right_status[win_start:win_end]
+        left_slice = left[win_start:win_end]
+        right_slice = right[win_start:win_end]
+        has_truncation = True
+    else:
+        left_slice = left
+        right_slice = right
+        has_truncation = False
+
+    def _build_html(text: str, statuses: list[int], full_len: int) -> str:
+        parts: list[str] = []
+        for ch, st in zip(text, statuses):
+            esc_ch = escape(ch)
+            if st == 0:
+                parts.append(esc_ch)
+            elif st == 1:  # deleted (left-only)
+                parts.append(f'<span style="background:#fdd">{esc_ch}</span>')
+            else:  # inserted (right-only)
+                parts.append(f'<span style="background:#dfd">{esc_ch}</span>')
+        result = "".join(parts)
+        if has_truncation:
+            prefix = "…" if win_start > 0 else ""
+            suffix = "…" if win_end < full_len else ""
+            result = prefix + result + suffix
+        return f"<code>{result}</code>"
+
+    return (_build_html(left_slice, left_status, len(left)), _build_html(right_slice, right_status, len(right)))
+
+
 def describe_field_diff(fd: FieldDiff) -> str:
     if fd.diff_type == "add":
         return f'[field+] {fd.field_name}: "{_preview(fd.right_value or "", 20)}"'
@@ -113,16 +191,17 @@ def build_diff_details_html(op: Any) -> str:
     elif op.type == DiffOpType.REPLACE:
         left_text = str(op.meta.get("left_text", ""))
         right_text = str(op.meta.get("right_text", ""))
+        left_html, right_html = _inline_char_diff_html(left_text, right_text)
         details += "<h3 style='color:#2980b9;margin-top:0'>[~] Content Changed</h3>"
         details += (
             "<p><b>Left</b></p>"
             "<div style='background:#f0f7fb;padding:10px;border-left:3px solid #2980b9'>"
-            f"<code>{escape(left_text)}</code></div>"
+            f"{left_html}</div>"
         )
         details += (
             "<p><b>Right</b></p>"
             "<div style='background:#f0f7fb;padding:10px;border-left:3px solid #2980b9'>"
-            f"<code>{escape(right_text)}</code></div>"
+            f"{right_html}</div>"
         )
         details += f"<p style='color:#7f8c8d'>Left {len(left_text)} chars | Right {len(right_text)} chars</p>"
     elif op.type == DiffOpType.FORMAT_CHANGE:

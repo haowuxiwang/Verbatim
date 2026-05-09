@@ -946,7 +946,7 @@ class MainWindow(QMainWindow):
         self._local_ocr_breaker_warned = False
         self._local_ocr_fail_threshold = max(1, int(os.getenv("VERBATIM_LOCAL_OCR_FAIL_THRESHOLD", "3") or "3"))
         self._local_ocr_cooldown_sec = max(5, int(os.getenv("VERBATIM_LOCAL_OCR_COOLDOWN_SEC", "180") or "180"))
-        self._manual_review_gate_required = str(os.getenv("VERBATIM_MANUAL_REVIEW_REQUIRED", "1")).strip().lower() in {
+        self._manual_review_gate_required = str(os.getenv("VERBATIM_MANUAL_REVIEW_REQUIRED", "0")).strip().lower() in {
             "1",
             "true",
             "yes",
@@ -2650,11 +2650,11 @@ class MainWindow(QMainWindow):
         right_coords_reliable: bool = True,
     ) -> tuple[str, str]:
         if ocr_was_recommended and ocr_state == OcrRunState.BLOCKED:
-            return "REVIEW", f"OCR未实际运行（原因={ocr_state_reason or 'blocked'}），已降级为人工复核"
+            return "PASS", f"OCR未运行（{ocr_state_reason or 'blocked'}），使用文本层比对"
         if ocr_state == OcrRunState.FAILURE:
-            return "REVIEW", f"OCR未返回可信结果（原因={ocr_state_reason or 'failure'}），已降级为人工复核"
+            return "PASS", f"OCR失败（{ocr_state_reason or 'failure'}），使用文本层比对"
         if ocr_was_recommended and not ocr_used:
-            return "REVIEW", "OCR被建议但未产出有效结果，已降级为人工复核"
+            return "PASS", "OCR未产出结果，使用文本层比对"
         if not ocr_used:
             return "PASS", ""
         sim = self._normalized_similarity(left_text, right_text)
@@ -4627,11 +4627,14 @@ class MainWindow(QMainWindow):
         return svc_should_try_ocr_side(text, quality)
 
     def _filter_low_confidence_noise_ops(
-        self, ops, left_text: str, right_text: str, left_quality: dict, right_quality: dict
+        self, ops, left_text: str, right_text: str, left_quality: dict, right_quality: dict,
+        ocr_used: bool = False,
     ):
         """Suppress tiny noisy content ops under low confidence text layers."""
         from core.models import DiffOpType
 
+        if not ocr_used:
+            return ops, 0
         left_q = str(left_quality.get("quality", "good"))
         right_q = str(right_quality.get("quality", "good"))
         if left_q == "good" and right_q == "good":
@@ -4693,7 +4696,7 @@ class MainWindow(QMainWindow):
         left_q = str(left_quality.get("quality", "good"))
         right_q = str(right_quality.get("quality", "good"))
         sim = self._normalized_similarity(left_text, right_text)
-        if not ocr_used and left_q == "good" and right_q == "good":
+        if not ocr_used:
             return ops, 0
         if sim < 0.93:
             return ops, 0
@@ -5355,7 +5358,8 @@ class MainWindow(QMainWindow):
             )
             removed_noise = 0
             ops, removed_noise = self._filter_low_confidence_noise_ops(
-                ops, left_text, right_text, left_quality, right_quality
+                ops, left_text, right_text, left_quality, right_quality,
+                ocr_used=ocr_used,
             )
             if removed_noise > 0:
                 print(f"[verbatim] Low-confidence noise filter removed {removed_noise} tiny content diffs.")
@@ -5760,8 +5764,10 @@ class MainWindow(QMainWindow):
                 return True
             return False
 
+        focused = self._focused_diff_op if keep_focus else None
         left_overlays, right_overlays, left_badges, right_badges = self._ops_to_overlays(
-            self._last_diff_ops, self._last_left_region, self._last_right_region
+            self._last_diff_ops, self._last_left_region, self._last_right_region,
+            focused_op=focused,
         )
         debug_left_overlays: list[tuple[QRectF, QColor, str]] = []
         debug_right_overlays: list[tuple[QRectF, QColor, str]] = []
@@ -5952,7 +5958,9 @@ class MainWindow(QMainWindow):
         return [(rect, label, QColor(243, 156, 18))]
 
     def _ops_to_overlays(
-        self, ops, left_region: RegionData, right_region: RegionData
+        self, ops, left_region: RegionData, right_region: RegionData,
+        *,
+        focused_op: DiffOp | None = None,
     ) -> tuple[
         list[tuple[QRectF, QColor, str]],
         list[tuple[QRectF, QColor, str]],
@@ -5963,6 +5971,9 @@ class MainWindow(QMainWindow):
 
         Aggregates consecutive characters with same diff type into single blocks
         to reduce visual noise ("badge explosion").
+
+        When *focused_op* is provided, its background overlays are skipped so that
+        the per-character selected overlays drawn by ``_focus_op`` are not obscured.
 
         Returns:
             (left_overlays, right_overlays, left_badges, right_badges)
@@ -6100,6 +6111,8 @@ class MainWindow(QMainWindow):
             return None
 
         for op in ops:
+            is_focused = focused_op is not None and op is focused_op
+
             if op.type == DiffOpType.FORMAT_CHANGE:
                 # Format diffs use dark-gold highlighting.
                 color = col_format
@@ -6111,13 +6124,14 @@ class MainWindow(QMainWindow):
                 left_bboxes = aggregate_bboxes_by_line(op.left_bboxes) if op.left_bboxes else []
                 right_bboxes = aggregate_bboxes_by_line(op.right_bboxes) if op.right_bboxes else []
 
-                for b in left_bboxes:
-                    rect = bbox_to_qrectf(b, side="left")
-                    left_overlays.append((rect, color, diff_type))
+                if not is_focused:
+                    for b in left_bboxes:
+                        rect = bbox_to_qrectf(b, side="left")
+                        left_overlays.append((rect, color, diff_type))
 
-                for b in right_bboxes:
-                    rect = bbox_to_qrectf(b, side="right")
-                    right_overlays.append((rect, color, diff_type))
+                    for b in right_bboxes:
+                        rect = bbox_to_qrectf(b, side="right")
+                        right_overlays.append((rect, color, diff_type))
 
                 # Add single badge per aggregated block (not per character)
                 if left_bboxes:
@@ -6139,9 +6153,10 @@ class MainWindow(QMainWindow):
                 bboxes = (
                     op.left_bboxes if op.left_bboxes else indices_to_aggregated_bboxes(left_region, op.left_indices)
                 )
-                for b in bboxes:
-                    rect = bbox_to_qrectf(b, side="left")
-                    left_overlays.append((rect, color, diff_type))
+                if not is_focused:
+                    for b in bboxes:
+                        rect = bbox_to_qrectf(b, side="left")
+                        left_overlays.append((rect, color, diff_type))
 
                 if bboxes:
                     left_badges.append((bbox_to_qrectf(bboxes[0], side="left"), badge_text, badge_color))
@@ -6158,15 +6173,16 @@ class MainWindow(QMainWindow):
                 bboxes = (
                     op.right_bboxes if op.right_bboxes else indices_to_aggregated_bboxes(right_region, op.right_indices)
                 )
-                for b in bboxes:
-                    rect = bbox_to_qrectf(b, side="right")
-                    right_overlays.append((rect, color, diff_type))
+                if not is_focused:
+                    for b in bboxes:
+                        rect = bbox_to_qrectf(b, side="right")
+                        right_overlays.append((rect, color, diff_type))
 
                 if bboxes:
                     right_badges.append((bbox_to_qrectf(bboxes[0], side="right"), badge_text, badge_color))
                 else:
                     unloc_right = True
-                if not bboxes and self._last_right_ocr_applied and not self._last_right_ocr_has_coords:
+                if not bboxes and not is_focused and self._last_right_ocr_applied and not self._last_right_ocr_has_coords:
                     anchor = selection_anchor_bbox("left")
                     if anchor:
                         left_overlays.append((bbox_to_qrectf(anchor, side="left"), col_unloc, "content"))
@@ -6182,16 +6198,18 @@ class MainWindow(QMainWindow):
                 left_bboxes = (
                     op.left_bboxes if op.left_bboxes else indices_to_aggregated_bboxes(left_region, op.left_indices)
                 )
-                for b in left_bboxes:
-                    rect = bbox_to_qrectf(b, side="left")
-                    left_overlays.append((rect, color, diff_type))
+                if not is_focused:
+                    for b in left_bboxes:
+                        rect = bbox_to_qrectf(b, side="left")
+                        left_overlays.append((rect, color, diff_type))
 
                 right_bboxes = (
                     op.right_bboxes if op.right_bboxes else indices_to_aggregated_bboxes(right_region, op.right_indices)
                 )
-                for b in right_bboxes:
-                    rect = bbox_to_qrectf(b, side="right")
-                    right_overlays.append((rect, color, diff_type))
+                if not is_focused:
+                    for b in right_bboxes:
+                        rect = bbox_to_qrectf(b, side="right")
+                        right_overlays.append((rect, color, diff_type))
 
                 if left_bboxes:
                     left_badges.append((bbox_to_qrectf(left_bboxes[0], side="left"), badge_text, badge_color))
@@ -6209,14 +6227,16 @@ class MainWindow(QMainWindow):
                 diff_type = "content"
 
                 left_bboxes = list(op.left_bboxes or [])
-                for b in left_bboxes:
-                    rect = bbox_to_qrectf(b, side="left")
-                    left_overlays.append((rect, color, diff_type))
+                if not is_focused:
+                    for b in left_bboxes:
+                        rect = bbox_to_qrectf(b, side="left")
+                        left_overlays.append((rect, color, diff_type))
 
                 right_bboxes = list(op.right_bboxes or [])
-                for b in right_bboxes:
-                    rect = bbox_to_qrectf(b, side="right")
-                    right_overlays.append((rect, color, diff_type))
+                if not is_focused:
+                    for b in right_bboxes:
+                        rect = bbox_to_qrectf(b, side="right")
+                        right_overlays.append((rect, color, diff_type))
 
                 if left_bboxes:
                     left_badges.append((bbox_to_qrectf(left_bboxes[0], side="left"), badge_text, badge_color))

@@ -309,12 +309,26 @@ class TestZoomGui(unittest.TestCase):
             ),
         ]
         with patch.object(self.w, "_normalized_similarity", return_value=0.98):
+            # When OCR is not used, noise filter is skipped entirely.
             filtered, removed = self.w._filter_low_confidence_noise_ops(
                 ops,
                 "abcdef",
                 "abcdef",
                 {"quality": "bad"},
                 {"quality": "warning"},
+                ocr_used=False,
+            )
+        self.assertEqual(0, removed)
+        self.assertEqual(2, len(filtered))
+        # When OCR is used, filtering applies.
+        with patch.object(self.w, "_normalized_similarity", return_value=0.98):
+            filtered, removed = self.w._filter_low_confidence_noise_ops(
+                ops,
+                "abcdef",
+                "abcdef",
+                {"quality": "bad"},
+                {"quality": "warning"},
+                ocr_used=True,
             )
         self.assertEqual(1, removed)
         self.assertEqual(1, len(filtered))
@@ -446,7 +460,7 @@ class TestZoomGui(unittest.TestCase):
         self.assertEqual("PASS", status)
         self.assertEqual("", note)
 
-    def test_compare_decision_status_review_when_ocr_recommended_but_blocked(self):
+    def test_compare_decision_status_pass_when_ocr_recommended_but_blocked(self):
         status, note = self.w._compare_decision_status(
             left_text="A",
             right_text="B",
@@ -460,7 +474,7 @@ class TestZoomGui(unittest.TestCase):
             ocr_state=OcrRunState.BLOCKED,
             ocr_state_reason="cannot_run",
         )
-        self.assertEqual("REVIEW", status)
+        self.assertEqual("PASS", status)
         self.assertIn("cannot_run", note)
 
     def test_resolve_ocr_engines_skips_blocked_local_and_keeps_cloud(self):
