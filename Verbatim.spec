@@ -19,7 +19,29 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['torch', 'torchvision', 'torchaudio', 'tensorflow', 'paddle', 'cv2', 'sklearn', 'scipy', 'pandas', 'transformers', 'openpyxl', 'sqlalchemy', 'pytest', 'nltk'],
+    excludes=[
+        # ML/DL frameworks
+        'torch', 'torchvision', 'torchaudio', 'tensorflow', 'paddle',
+        'sklearn', 'scipy', 'pandas', 'transformers', 'onnxruntime',
+        # NLP
+        'spacy', 'blis', 'thinc', 'nltk', 'tiktoken', 'tokenizers',
+        # Data/IO
+        'pyarrow', 'openpyxl', 'sqlalchemy', 'psycopg2',
+        # Web/async
+        'playwright', 'aiohttp', 'yarl', 'multidict', 'frozenlist',
+        # Visualization
+        'matplotlib',
+        # PDF (redundant with PyMuPDF)
+        'pdfminer',
+        # Scientific/geospatial
+        'numpy', 'Shapely',
+        # Image (keep PIL — raster_diff.py uses it)
+        'cv2',
+        # Misc
+        'Pythonwin', 'lxml', 'pyphen',
+        # Testing
+        'pytest',
+    ],
     noarchive=False,
     optimize=0,
 )
